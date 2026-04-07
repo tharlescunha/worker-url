@@ -1,0 +1,255 @@
+"""
+Fluxo do cadastro do runner.
+
+Fluxo correto:
+- login do usuário no sistema
+- registro do worker pela rota /api/v1/worker/registration/
+- backend devolve o runner_token bruto
+- worker salva esse token localmente para autenticar
+  sync, heartbeat e tasks
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Callable
+from uuid import uuid4
+
+from app.core.config_models import (
+    AuthData,
+    BotRegistryItem,
+    BotsRegistry,
+    RunnerConfigData,
+    RunnerData,
+)
+from app.core.constants import AUTH_FILE, BOTS_REGISTRY_FILE, RUNNER_FILE
+from app.core.exceptions import RunnerRegistrationError, ValidationError
+from app.core.http_client import HttpClient
+from app.core.json_store import save_model
+from app.core.machine_info import collect_machine_info
+from app.core.paths import create_worker_structure
+from app.core.security import protect_text
+
+LOGIN_PATH = "/api/v1/auth/login"
+REGISTER_RUNNER_PATH = "/api/v1/worker/registration/"
+
+
+@dataclass
+class InstallerInput:
+    base_url: str
+    login: str
+    password: str
+    runner_name: str
+    runner_label: str
+    access_remote: bool = False
+
+
+def validate_installer_input(data: InstallerInput) -> None:
+    if not data.base_url.strip():
+        raise ValidationError("Informe a URL base do sistema.")
+    if not data.login.strip():
+        raise ValidationError("Informe o login.")
+    if not data.password.strip():
+        raise ValidationError("Informe a senha.")
+    if not data.runner_name.strip():
+        raise ValidationError("Informe o nome do runner.")
+    if not data.runner_label.strip():
+        raise ValidationError("Informe o label do runner.")
+
+
+def authenticate_user(client: HttpClient, login: str, password: str) -> dict:
+    payload = {
+        "login": login,
+        "password": password,
+    }
+    return client.post(LOGIN_PATH, payload)
+
+
+def build_runner_payload(installer_input: InstallerInput, machine: dict) -> dict:
+    return {
+        "uuid": str(uuid4()),
+        "name": installer_input.runner_name,
+        "label": installer_input.runner_label,
+        "host_name": machine.get("host_name"),
+        "ip": machine.get("ip"),
+        "os_name": machine.get("os_name"),
+        "os_version": machine.get("os_version"),
+        "cpu_arch": machine.get("cpu_arch"),
+        "memory_total": machine.get("memory_total"),
+        "access_remote": installer_input.access_remote,
+    }
+
+
+def register_runner(client: HttpClient, installer_input: InstallerInput, machine: dict) -> dict:
+    payload = build_runner_payload(installer_input, machine)
+    return client.post(REGISTER_RUNNER_PATH, payload)
+
+
+def persist_auth_data(
+    base_url: str,
+    login: str,
+    access_token: str,
+    refresh_token: str | None,
+    token_type: str | None,
+) -> None:
+    auth = AuthData(
+        base_url=base_url.rstrip("/"),
+        login=login,
+        encrypted_access_token=protect_text(access_token),
+        encrypted_refresh_token=protect_text(refresh_token) if refresh_token else None,
+        token_type=token_type or "bearer",
+        encryption="dpapi_machine",
+        saved_at=datetime.now(timezone.utc),
+    )
+    save_model(AUTH_FILE, auth)
+
+
+def persist_runner_data(response: dict, installer_input: InstallerInput, machine: dict) -> None:
+    runner_token = response.get("token")
+    if not runner_token:
+        raise RunnerRegistrationError("Backend não retornou token do runner.")
+
+    runner_id = response.get("runner_id")
+    runner_uuid = response.get("uuid")
+
+    if not runner_id or not runner_uuid:
+        raise RunnerRegistrationError("A resposta do worker/register não trouxe runner_id e uuid.")
+
+    runner_config = RunnerConfigData(
+        max_concurrency=response.get("max_concurrency", 1),
+        allowed_parallel_bots={},
+        polling_interval=response.get("polling_interval", 10),
+        auto_update_bots=True,
+        install_all_bots_on_register=False,
+        maintenance_mode=False,
+    )
+
+    runner = RunnerData(
+        id=runner_id,
+        uuid=runner_uuid,
+        name=response.get("name", installer_input.runner_name),
+        label=installer_input.runner_label,
+        host_name=machine.get("host_name", ""),
+        ip=machine.get("ip", ""),
+        os_name=machine.get("os_name", ""),
+        os_version=machine.get("os_version", ""),
+        cpu_arch=machine.get("cpu_arch", ""),
+        memory_total=machine.get("memory_total", 0),
+        access_remote=installer_input.access_remote,
+        enabled=response.get("enabled", True),
+        status=response.get("status", "offline"),
+        token_hash="",
+        runner_token=runner_token,
+        created_at=None,
+        updated_at=None,
+        last_heartbeat=None,
+        config=runner_config,
+    )
+
+    save_model(RUNNER_FILE, runner)
+
+
+def persist_bots_registry(response: dict) -> None:
+    raw_bots = response.get("bots", [])
+
+    items: list[BotRegistryItem] = []
+    for bot in raw_bots:
+        bot_id = str(bot.get("bot_id") or bot.get("id") or "")
+        if not bot_id:
+            continue
+
+        items.append(
+            BotRegistryItem(
+                bot_id=bot_id,
+                name=bot.get("name", ""),
+                technology=bot.get("technology"),
+                source_type=bot.get("source_type"),
+                repository_url=bot.get("repository_url") or bot.get("source_url"),
+                artifact_path=bot.get("artifact_path"),
+                branch=bot.get("branch"),
+                entrypoint=bot.get("entrypoint"),
+                requirements_file=bot.get("requirements_file"),
+                timeout_default=bot.get("timeout_default"),
+                checksum=bot.get("checksum"),
+                expected_version=bot.get("version"),
+                expected_commit=bot.get("commit_hash"),
+                local_path="",
+                venv_path="",
+                installed_version=None,
+                installed_commit=None,
+                requirements_hash=None,
+                last_install_status="not_installed",
+                last_install_message="Bot ainda não baixado localmente.",
+                linked=True,
+            )
+        )
+
+    save_model(BOTS_REGISTRY_FILE, BotsRegistry(bots=items))
+
+
+def run_registration_flow(
+    installer_input: InstallerInput,
+    progress_callback: Callable[[str], None] | None = None,
+) -> dict:
+    def notify(message: str) -> None:
+        if progress_callback:
+            progress_callback(message)
+
+    validate_installer_input(installer_input)
+
+    notify("Autenticando no sistema...")
+    client = HttpClient(base_url=installer_input.base_url)
+
+    auth_response = authenticate_user(
+        client=client,
+        login=installer_input.login,
+        password=installer_input.password,
+    )
+
+    access_token = auth_response.get("access_token")
+    refresh_token = auth_response.get("refresh_token")
+    token_type = auth_response.get("token_type", "bearer")
+
+    if not access_token:
+        raise RunnerRegistrationError("O login não retornou access_token.")
+
+    client.set_token(access_token)
+
+    notify("Coletando informações da máquina...")
+    machine = collect_machine_info()
+
+    notify("Registrando a máquina no backend...")
+    register_response = register_runner(
+        client=client,
+        installer_input=installer_input,
+        machine=machine,
+    )
+
+    notify("Criando estrutura local do worker...")
+    create_worker_structure()
+
+    notify("Salvando autenticação protegida...")
+    persist_auth_data(
+        base_url=installer_input.base_url,
+        login=installer_input.login,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_type=token_type,
+    )
+
+    notify("Salvando dados do runner...")
+    persist_runner_data(
+        response=register_response,
+        installer_input=installer_input,
+        machine=machine,
+    )
+
+    notify("Salvando registro local de bots...")
+    persist_bots_registry(register_response)
+
+    notify("Cadastro concluído com sucesso.")
+    return {
+        "auth": auth_response,
+        "runner": register_response,
+    }
