@@ -1,284 +1,157 @@
 from __future__ import annotations
 
-import hashlib
-import shutil
-import subprocess
-import sys
-from dataclasses import dataclass
-from pathlib import Path
+from datetime import datetime, timezone
 
-from app.core.config_models import BotRegistryItem
-from app.core.constants import BOTS_DIR, VENVS_DIR
-from app.core.exceptions import BotInstallError
+from app.core.config_models import BotRegistryItem, BotsRegistry
+from app.core.constants import BOTS_REGISTRY_FILE
+from app.core.http_client import HttpClient
+from app.core.json_store import load_model, save_model
+from app.sync.bot_installer import install_or_update_bot
 
 
-@dataclass
-class InstallResult:
-    local_path: str
-    venv_path: str
-    installed_commit: str | None
-    requirements_hash: str | None
-    message: str
+SYNC_PATH = "/api/v1/worker/sync"
 
 
-def install_or_update_bot(bot: BotRegistryItem) -> InstallResult:
-    source_url = _resolve_source_url(bot)
-    bot_dir = BOTS_DIR / f"bot_{bot.bot_id}"
-    venv_dir = VENVS_DIR / f"bot_{bot.bot_id}"
+def load_registry() -> BotsRegistry:
+    data = load_model(BOTS_REGISTRY_FILE, BotsRegistry)
+    if not data:
+        return BotsRegistry(bots=[])
+    return data
 
-    _ensure_git_available()
-    _prepare_repository(bot_dir=bot_dir, source_url=source_url)
-    _checkout_expected_revision(bot=bot, bot_dir=bot_dir)
-    installed_commit = _get_current_commit(bot_dir)
 
-    venv_python = _ensure_venv(venv_dir)
-    requirements_hash = _install_requirements(
-        bot=bot,
-        bot_dir=bot_dir,
-        venv_python=venv_python,
+def save_registry(registry: BotsRegistry) -> None:
+    save_model(BOTS_REGISTRY_FILE, registry)
+
+
+def find_local_bot(registry: BotsRegistry, bot_id: str) -> BotRegistryItem | None:
+    for bot in registry.bots:
+        if bot.bot_id == bot_id:
+            return bot
+    return None
+
+
+def sync_bots(client: HttpClient, runner_data) -> dict:
+    payload = {
+        "uuid": runner_data.uuid,
+        "token": runner_data.runner_token,
+        "host_name": runner_data.host_name,
+        "ip": runner_data.ip,
+    }
+
+    response = client.post(SYNC_PATH, payload)
+
+    remote_bots = response.get("bots", [])
+    registry = load_registry()
+    updated_items: list[BotRegistryItem] = []
+
+    installed_count = 0
+    updated_count = 0
+    failed_count = 0
+
+    for bot_data in remote_bots:
+        bot_id = str(bot_data.get("bot_id") or bot_data.get("id") or "")
+        if not bot_id:
+            continue
+
+        local = find_local_bot(registry, bot_id)
+
+        if local:
+            current = local
+            current.linked = True
+            current.name = bot_data.get("name", current.name)
+        else:
+            current = BotRegistryItem(
+                bot_id=bot_id,
+                name=bot_data.get("name", ""),
+                linked=True,
+            )
+
+        current.bot_version_id = bot_data.get("bot_version_id")
+        current.technology = bot_data.get("technology")
+        current.source_type = bot_data.get("source_type")
+        current.repository_url = bot_data.get("repository_url") or bot_data.get("source_url")
+        current.artifact_path = bot_data.get("artifact_path")
+        current.branch = bot_data.get("branch")
+        current.entrypoint = bot_data.get("entrypoint")
+        current.requirements_file = bot_data.get("requirements_file")
+        current.timeout_default = bot_data.get("timeout_default")
+        current.checksum = bot_data.get("checksum")
+        current.expected_version = bot_data.get("version")
+        current.expected_commit = bot_data.get("commit_hash")
+        current.last_sync_at = datetime.now(timezone.utc)
+
+        needs_install = _needs_install(current)
+
+        if needs_install:
+            try:
+                had_local_install = bool(current.local_path and current.venv_path)
+
+                result = install_or_update_bot(current)
+
+                current.local_path = result.local_path
+                current.venv_path = result.venv_path
+                current.installed_version = current.expected_version
+                current.installed_commit = result.installed_commit
+                current.requirements_hash = result.requirements_hash
+                current.last_install_status = "ok"
+                current.last_install_message = result.message
+
+                if had_local_install:
+                    updated_count += 1
+                else:
+                    installed_count += 1
+
+            except Exception as exc:
+                current.last_install_status = "error"
+                current.last_install_message = str(exc)
+                failed_count += 1
+        else:
+            current.last_install_status = "ok"
+            current.last_install_message = "Bot alinhado com a versão esperada."
+
+        updated_items.append(current)
+
+    for local_bot in registry.bots:
+        if not any(bot.bot_id == local_bot.bot_id for bot in updated_items):
+            local_bot.linked = False
+            local_bot.last_sync_at = datetime.now(timezone.utc)
+            local_bot.last_install_message = "Bot não retornou no sync atual."
+            updated_items.append(local_bot)
+
+    new_registry = BotsRegistry(bots=updated_items)
+    save_registry(new_registry)
+
+    runner_data.config.polling_interval = response.get(
+        "polling_interval",
+        runner_data.config.polling_interval,
+    )
+    runner_data.config.max_concurrency = response.get(
+        "max_concurrency",
+        runner_data.config.max_concurrency,
     )
 
-    message = (
-        f"Bot preparado com sucesso. "
-        f"repo={bot_dir} venv={venv_dir} commit={installed_commit or 'desconhecido'}"
-    )
-
-    return InstallResult(
-        local_path=str(bot_dir),
-        venv_path=str(venv_dir),
-        installed_commit=installed_commit,
-        requirements_hash=requirements_hash,
-        message=message,
-    )
+    return {
+        "total": len(updated_items),
+        "linked": len([b for b in updated_items if b.linked]),
+        "installed": installed_count,
+        "updated": updated_count,
+        "failed": failed_count,
+        "polling_interval": response.get("polling_interval"),
+        "max_concurrency": response.get("max_concurrency"),
+    }
 
 
-def _resolve_source_url(bot: BotRegistryItem) -> str:
-    source_type = (bot.source_type or "").strip().lower()
+def _needs_install(bot: BotRegistryItem) -> bool:
+    if not bot.local_path or not bot.venv_path:
+        return True
 
-    if source_type in ("git", "") and bot.repository_url:
-        return bot.repository_url
+    if bot.installed_version != bot.expected_version:
+        return True
 
-    if bot.repository_url:
-        return bot.repository_url
+    if bot.expected_commit and bot.installed_commit != bot.expected_commit:
+        return True
 
-    raise BotInstallError(
-        f"Bot {bot.bot_id} sem repository_url para instalação via Git."
-    )
+    if bot.last_install_status in ("error", "not_installed", "outdated"):
+        return True
 
-
-def _ensure_git_available() -> None:
-    if shutil.which("git") is None:
-        raise BotInstallError("Git não encontrado no PATH da máquina.")
-
-
-def _prepare_repository(bot_dir: Path, source_url: str) -> None:
-    if not bot_dir.exists():
-        bot_dir.parent.mkdir(parents=True, exist_ok=True)
-        _run_command(
-            ["git", "clone", source_url, str(bot_dir)],
-            cwd=None,
-            error_prefix=f"Falha ao clonar repositório {source_url}",
-        )
-        return
-
-    if not (bot_dir / ".git").exists():
-        raise BotInstallError(
-            f"A pasta do bot existe mas não é um repositório Git válido: {bot_dir}"
-        )
-
-    _run_command(
-        ["git", "remote", "set-url", "origin", source_url],
-        cwd=bot_dir,
-        error_prefix="Falha ao atualizar remote origin",
-    )
-
-    _run_command(
-        ["git", "fetch", "--all", "--tags", "--prune"],
-        cwd=bot_dir,
-        error_prefix="Falha ao fazer git fetch",
-    )
-
-    _force_clean_repository(bot_dir)
-
-
-def _force_clean_repository(bot_dir: Path) -> None:
-    _run_command(
-        ["git", "reset", "--hard", "HEAD"],
-        cwd=bot_dir,
-        error_prefix="Falha ao descartar alterações locais do repositório",
-    )
-
-    _run_command(
-        ["git", "clean", "-fd"],
-        cwd=bot_dir,
-        error_prefix="Falha ao remover arquivos locais não rastreados",
-    )
-
-
-def _checkout_expected_revision(bot: BotRegistryItem, bot_dir: Path) -> None:
-    expected_commit = (bot.expected_commit or "").strip()
-    branch = (bot.branch or "").strip()
-
-    if expected_commit:
-        _run_command(
-            ["git", "checkout", "--force", expected_commit],
-            cwd=bot_dir,
-            error_prefix=f"Falha ao fazer checkout do commit {expected_commit}",
-        )
-        _run_command(
-            ["git", "reset", "--hard", expected_commit],
-            cwd=bot_dir,
-            error_prefix=f"Falha ao alinhar repositório no commit {expected_commit}",
-        )
-        _run_command(
-            ["git", "clean", "-fd"],
-            cwd=bot_dir,
-            error_prefix="Falha ao limpar arquivos locais após checkout do commit",
-        )
-        return
-
-    if branch:
-        _run_command(
-            ["git", "checkout", "--force", branch],
-            cwd=bot_dir,
-            error_prefix=f"Falha ao fazer checkout da branch {branch}",
-        )
-        _run_command(
-            ["git", "fetch", "origin", branch],
-            cwd=bot_dir,
-            error_prefix=f"Falha ao buscar atualização da branch {branch}",
-        )
-        _run_command(
-            ["git", "reset", "--hard", f"origin/{branch}"],
-            cwd=bot_dir,
-            error_prefix=f"Falha ao forçar atualização da branch {branch}",
-        )
-        _run_command(
-            ["git", "clean", "-fd"],
-            cwd=bot_dir,
-            error_prefix=f"Falha ao limpar arquivos locais da branch {branch}",
-        )
-        return
-
-    current_branch = _get_current_branch(bot_dir)
-
-    if current_branch:
-        _run_command(
-            ["git", "fetch", "origin", current_branch],
-            cwd=bot_dir,
-            error_prefix=f"Falha ao buscar atualização da branch {current_branch}",
-        )
-        _run_command(
-            ["git", "reset", "--hard", f"origin/{current_branch}"],
-            cwd=bot_dir,
-            error_prefix=f"Falha ao forçar atualização da branch {current_branch}",
-        )
-        _run_command(
-            ["git", "clean", "-fd"],
-            cwd=bot_dir,
-            error_prefix=f"Falha ao limpar arquivos locais da branch {current_branch}",
-        )
-        return
-
-    _run_command(
-        ["git", "fetch", "--all", "--tags", "--prune"],
-        cwd=bot_dir,
-        error_prefix="Falha ao atualizar repositório",
-    )
-
-
-def _get_current_branch(bot_dir: Path) -> str | None:
-    result = _run_command(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        cwd=bot_dir,
-        error_prefix="Falha ao obter branch atual",
-    )
-    branch = (result.stdout or "").strip()
-
-    if not branch or branch == "HEAD":
-        return None
-
-    return branch
-
-
-def _get_current_commit(bot_dir: Path) -> str | None:
-    result = _run_command(
-        ["git", "rev-parse", "HEAD"],
-        cwd=bot_dir,
-        error_prefix="Falha ao obter commit atual",
-    )
-    commit = (result.stdout or "").strip()
-    return commit or None
-
-
-def _ensure_venv(venv_dir: Path) -> Path:
-    venv_python = _venv_python(venv_dir)
-
-    if not venv_python.exists():
-        venv_dir.parent.mkdir(parents=True, exist_ok=True)
-        _run_command(
-            [sys.executable, "-m", "venv", str(venv_dir)],
-            cwd=None,
-            error_prefix=f"Falha ao criar venv do bot em {venv_dir}",
-        )
-
-    if not venv_python.exists():
-        raise BotInstallError(f"Venv criada, mas python não encontrado em {venv_python}")
-
-    _run_command(
-        [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"],
-        cwd=None,
-        error_prefix="Falha ao atualizar pip da venv",
-    )
-
-    return venv_python
-
-
-def _install_requirements(bot: BotRegistryItem, bot_dir: Path, venv_python: Path) -> str | None:
-    requirements_name = (bot.requirements_file or "requirements.txt").strip()
-    requirements_path = bot_dir / requirements_name
-
-    if not requirements_path.exists():
-        return None
-
-    _run_command(
-        [str(venv_python), "-m", "pip", "install", "-r", str(requirements_path)],
-        cwd=bot_dir,
-        error_prefix=f"Falha ao instalar requirements do bot {bot.bot_id}",
-    )
-
-    return _sha256_file(requirements_path)
-
-
-def _sha256_file(file_path: Path) -> str:
-    sha = hashlib.sha256()
-    with file_path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            sha.update(chunk)
-    return sha.hexdigest()
-
-
-def _venv_python(venv_dir: Path) -> Path:
-    return venv_dir / "Scripts" / "python.exe"
-
-
-def _run_command(command: list[str], cwd: Path | None, error_prefix: str) -> subprocess.CompletedProcess:
-    try:
-        result = subprocess.run(
-            command,
-            cwd=str(cwd) if cwd else None,
-            capture_output=True,
-            text=True,
-            shell=False,
-            check=False,
-        )
-    except Exception as exc:
-        raise BotInstallError(f"{error_prefix}: {exc}") from exc
-
-    if result.returncode != 0:
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
-        detail = stderr or stdout or "sem detalhes"
-        raise BotInstallError(f"{error_prefix}: {detail}")
-
-    return result
+    return False

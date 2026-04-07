@@ -1,9 +1,10 @@
-# app\ui\app_window.py
-
 from __future__ import annotations
 
+import re
+from typing import Any
+
 import requests
-from PySide6.QtCore import QThread, Qt, Signal
+from PySide6.QtCore import QThread, Qt, Signal, QSize
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -18,7 +19,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QSizePolicy,
     QStackedWidget,
+    QStyle,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -91,22 +94,21 @@ class StepIndicator(QFrame):
         self.completed = False
 
         self.setObjectName("stepIndicator")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(10)
+        layout.setContentsMargins(8, 7, 8, 7)
+        layout.setSpacing(8)
 
         self.circle = QLabel(str(number))
-        self.circle.setFixedSize(28, 28)
+        self.circle.setFixedSize(24, 24)
         self.circle.setAlignment(Qt.AlignCenter)
-        self.circle.setObjectName("stepCircle")
 
         self.label = QLabel(title)
-        self.label.setObjectName("stepLabel")
+        self.label.setWordWrap(True)
 
-        layout.addWidget(self.circle)
-        layout.addWidget(self.label)
-        layout.addStretch()
+        layout.addWidget(self.circle, 0, Qt.AlignTop)
+        layout.addWidget(self.label, 1)
 
         self.refresh_style()
 
@@ -122,34 +124,37 @@ class StepIndicator(QFrame):
                 """
                 background-color: #22c55e;
                 color: white;
-                border-radius: 14px;
+                border-radius: 12px;
                 font-weight: bold;
-            """
+                font-size: 12px;
+                """
             )
-            self.label.setStyleSheet("color: #e5e7eb; font-weight: 600;")
+            self.label.setStyleSheet("color: #ffffff; font-weight: 600; font-size: 12px;")
         elif self.active:
             self.circle.setText(str(self.number))
             self.circle.setStyleSheet(
                 """
                 background-color: #2563eb;
                 color: white;
-                border-radius: 14px;
+                border-radius: 12px;
                 font-weight: bold;
-            """
+                font-size: 12px;
+                """
             )
-            self.label.setStyleSheet("color: white; font-weight: 700;")
+            self.label.setStyleSheet("color: #ffffff; font-weight: 700; font-size: 12px;")
         else:
             self.circle.setText(str(self.number))
             self.circle.setStyleSheet(
                 """
-                background-color: #2a2f3a;
+                background-color: #1e293b;
                 color: #9ca3af;
-                border: 1px solid #3b4252;
-                border-radius: 14px;
+                border: 1px solid #334155;
+                border-radius: 12px;
                 font-weight: bold;
-            """
+                font-size: 12px;
+                """
             )
-            self.label.setStyleSheet("color: #9ca3af; font-weight: 500;")
+            self.label.setStyleSheet("color: #94a3b8; font-weight: 500; font-size: 12px;")
 
 
 class InstallerWindow(QMainWindow):
@@ -157,7 +162,8 @@ class InstallerWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("Assistente de Cadastro do Worker OrkaFlow")
-        self.setMinimumSize(1040, 720)
+        self.resize(1160, 760)
+        self.setMinimumSize(980, 660)
 
         self.result_data: dict | None = None
         self.current_step = 0
@@ -173,51 +179,74 @@ class InstallerWindow(QMainWindow):
         self.setStyleSheet(
             """
             QMainWindow, QWidget {
-                background-color: #0f1115;
+                background-color: #070d16;
                 color: #f3f4f6;
-                font-size: 13px;
+                font-size: 12px;
             }
 
             QLabel#pageTitle {
-                font-size: 26px;
-                font-weight: 700;
+                font-size: 24px;
+                font-weight: 800;
                 color: #ffffff;
             }
 
             QLabel#pageSubtitle {
-                font-size: 13px;
-                color: #9ca3af;
+                font-size: 12px;
+                color: #9fb0c7;
             }
 
             QLabel#sectionTitle {
-                font-size: 18px;
+                font-size: 13px;
                 font-weight: 700;
                 color: #ffffff;
             }
 
             QLabel#infoText {
                 color: #cbd5e1;
-                line-height: 1.4em;
+                line-height: 1.30em;
+                font-size: 12px;
+            }
+
+            QLabel#dashboardInfo {
+                color: #dbe4f0;
+                font-size: 11px;
+                line-height: 1.30em;
             }
 
             QFrame#contentCard {
-                background-color: #171a21;
-                border: 1px solid #262b36;
-                border-radius: 18px;
+                background-color: #0d1728;
+                border: 1px solid #1c2940;
+                border-radius: 14px;
             }
 
             QFrame#sidePanel {
-                background-color: #141821;
-                border-right: 1px solid #232834;
+                background-color: #08142b;
+                border-right: 1px solid #1c2940;
+            }
+
+            QFrame#stepIndicator {
+                background-color: #081326;
+                border: 1px solid #16243a;
+                border-radius: 12px;
+            }
+
+            QFrame#leftActionPanel {
+                background-color: transparent;
+                border: none;
+            }
+
+            QFrame#actionGroupCard {
+                background-color: #0c1930;
+                border: 1px solid #1d3150;
+                border-radius: 12px;
             }
 
             QLineEdit, QTextEdit {
-                background-color: #0f131a;
-                border: 1px solid #2b3240;
-                border-radius: 10px;
-                padding: 10px 12px;
+                background-color: #07111f;
+                border: 1px solid #21314b;
+                border-radius: 8px;
+                padding: 8px 10px;
                 color: white;
-                min-height: 18px;
             }
 
             QLineEdit:focus, QTextEdit:focus {
@@ -225,14 +254,17 @@ class InstallerWindow(QMainWindow):
             }
 
             QTextEdit {
+                font-size: 11px;
                 padding: 8px 10px;
             }
 
             QPushButton {
-                border-radius: 10px;
-                padding: 10px 16px;
-                min-height: 20px;
+                border-radius: 8px;
+                padding: 5px 10px;
+                min-height: 28px;
+                max-height: 28px;
                 font-weight: 600;
+                text-align: left;
             }
 
             QPushButton#primaryButton {
@@ -246,13 +278,13 @@ class InstallerWindow(QMainWindow):
             }
 
             QPushButton#secondaryButton {
-                background-color: #1f2430;
+                background-color: #13233a;
                 color: #e5e7eb;
-                border: 1px solid #313846;
+                border: 1px solid #28405f;
             }
 
             QPushButton#secondaryButton:hover {
-                background-color: #262d3a;
+                background-color: #19304d;
             }
 
             QPushButton#successButton {
@@ -265,42 +297,54 @@ class InstallerWindow(QMainWindow):
                 background-color: #15803d;
             }
 
+            QPushButton:disabled {
+                background-color: #16202c;
+                color: #6b7280;
+                border: 1px solid #243041;
+            }
+
             QLabel#statusOk {
                 color: #4ade80;
-                font-weight: 600;
+                font-weight: 700;
+                font-size: 11px;
             }
 
             QLabel#statusError {
                 color: #f87171;
-                font-weight: 600;
+                font-weight: 700;
+                font-size: 11px;
             }
 
             QLabel#statusNeutral {
                 color: #cbd5e1;
+                font-size: 11px;
             }
 
             QLabel#statusWarning {
                 color: #fbbf24;
-                font-weight: 600;
+                font-weight: 700;
+                font-size: 11px;
             }
 
             QProgressBar {
-                border: 1px solid #2b3240;
-                border-radius: 8px;
-                background-color: #0f131a;
+                border: 1px solid #243041;
+                border-radius: 7px;
+                background-color: #0b1220;
                 text-align: center;
-                min-height: 14px;
+                min-height: 12px;
             }
 
             QProgressBar::chunk {
                 background-color: #2563eb;
-                border-radius: 7px;
+                border-radius: 6px;
             }
 
             QCheckBox {
-                spacing: 8px;
+                spacing: 6px;
+                color: #dbe4f0;
+                font-size: 11px;
             }
-        """
+            """
         )
 
     def _build_ui(self) -> None:
@@ -320,22 +364,23 @@ class InstallerWindow(QMainWindow):
     def _build_side_panel(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("sidePanel")
-        panel.setFixedWidth(280)
+        panel.setMinimumWidth(228)
+        panel.setMaximumWidth(228)
 
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(24, 28, 24, 28)
-        layout.setSpacing(18)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
 
         logo = QLabel("OrkaFlow")
-        logo.setStyleSheet("font-size: 22px; font-weight: 800; color: white;")
+        logo.setStyleSheet("font-size: 18px; font-weight: 800; color: white;")
 
         subtitle = QLabel("Assistente de configuração do worker")
         subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("color: #9ca3af; font-size: 13px;")
+        subtitle.setStyleSheet("color: #94a3b8; font-size: 11px;")
 
         layout.addWidget(logo)
         layout.addWidget(subtitle)
-        layout.addSpacing(18)
+        layout.addSpacing(4)
 
         self.step_widgets = [
             StepIndicator(1, "Boas-vindas"),
@@ -348,13 +393,52 @@ class InstallerWindow(QMainWindow):
         for step in self.step_widgets:
             layout.addWidget(step)
 
+        layout.addSpacing(6)
+
+        self.left_action_panel = QFrame()
+        self.left_action_panel.setObjectName("leftActionPanel")
+        self.left_action_panel.setVisible(False)
+
+        left_actions_layout = QVBoxLayout(self.left_action_panel)
+        left_actions_layout.setContentsMargins(0, 0, 0, 0)
+        left_actions_layout.setSpacing(6)
+
+        action_group = QFrame()
+        action_group.setObjectName("actionGroupCard")
+        action_group_layout = QVBoxLayout(action_group)
+        action_group_layout.setContentsMargins(8, 8, 8, 8)
+        action_group_layout.setSpacing(6)
+
+        self.dashboard_refresh_button = self._make_button("Atualizar status", "secondaryButton", "refresh")
+        self.dashboard_install_button = self._make_button("Instalar serviço", "successButton", "install")
+        self.dashboard_start_button = self._make_button("Iniciar serviço", "primaryButton", "start")
+        self.dashboard_stop_button = self._make_button("Parar serviço", "secondaryButton", "stop")
+        self.dashboard_restart_button = self._make_button("Reiniciar serviço", "primaryButton", "restart")
+        self.dashboard_close_button = self._make_button("Fechar", "secondaryButton", "close")
+
+        self.dashboard_refresh_button.clicked.connect(self._refresh_dashboard)
+        self.dashboard_install_button.clicked.connect(self._install_service_from_dashboard)
+        self.dashboard_start_button.clicked.connect(lambda: self._execute_service_action("start"))
+        self.dashboard_stop_button.clicked.connect(lambda: self._execute_service_action("stop"))
+        self.dashboard_restart_button.clicked.connect(lambda: self._execute_service_action("restart"))
+        self.dashboard_close_button.clicked.connect(self.close)
+
+        action_group_layout.addWidget(self.dashboard_refresh_button)
+        action_group_layout.addWidget(self.dashboard_install_button)
+        action_group_layout.addWidget(self.dashboard_start_button)
+        action_group_layout.addWidget(self.dashboard_stop_button)
+        action_group_layout.addWidget(self.dashboard_restart_button)
+        action_group_layout.addWidget(self.dashboard_close_button)
+
+        left_actions_layout.addWidget(action_group)
+        layout.addWidget(self.left_action_panel)
         layout.addStretch()
 
         footer = QLabel(
             "Este assistente registra a máquina, prepara o ambiente local e permite controlar o serviço do worker."
         )
         footer.setWordWrap(True)
-        footer.setStyleSheet("color: #6b7280; font-size: 12px;")
+        footer.setStyleSheet("color: #64748b; font-size: 10px;")
         layout.addWidget(footer)
 
         return panel
@@ -362,11 +446,12 @@ class InstallerWindow(QMainWindow):
     def _build_main_area(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(36, 28, 36, 28)
-        layout.setSpacing(18)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
 
         self.page_title = QLabel("Assistente de Cadastro do Worker")
         self.page_title.setObjectName("pageTitle")
+        self.page_title.setWordWrap(True)
 
         self.page_subtitle = QLabel(
             "Configure este computador para operar como worker do OrkaFlow."
@@ -379,17 +464,19 @@ class InstallerWindow(QMainWindow):
 
         self.content_card = QFrame()
         self.content_card.setObjectName("contentCard")
+        self.content_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
         shadow = QGraphicsDropShadowEffect()
-        shadow.setBlurRadius(30)
-        shadow.setOffset(0, 8)
+        shadow.setBlurRadius(20)
+        shadow.setOffset(0, 4)
         self.content_card.setGraphicsEffect(shadow)
 
         card_layout = QVBoxLayout(self.content_card)
-        card_layout.setContentsMargins(28, 28, 28, 28)
-        card_layout.setSpacing(20)
+        card_layout.setContentsMargins(16, 16, 16, 16)
+        card_layout.setSpacing(10)
 
         self.stack = QStackedWidget()
-        card_layout.addWidget(self.stack)
+        self.stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.stack.addWidget(self._build_welcome_page())
         self.stack.addWidget(self._build_prereq_page())
@@ -398,6 +485,7 @@ class InstallerWindow(QMainWindow):
         self.stack.addWidget(self._build_loading_page())
         self.stack.addWidget(self._build_dashboard_page())
 
+        card_layout.addWidget(self.stack)
         layout.addWidget(self.content_card, 1)
 
         return container
@@ -406,10 +494,11 @@ class InstallerWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(18)
+        layout.setSpacing(10)
 
         title_label = QLabel(title)
         title_label.setObjectName("sectionTitle")
+        title_label.setWordWrap(True)
 
         text_label = QLabel(text)
         text_label.setObjectName("infoText")
@@ -439,6 +528,7 @@ class InstallerWindow(QMainWindow):
         layout.addStretch()
 
         buttons = QHBoxLayout()
+        buttons.setSpacing(8)
         buttons.addStretch()
 
         start_button = self._make_button("Começar configuração", "primaryButton")
@@ -457,12 +547,15 @@ class InstallerWindow(QMainWindow):
 
         self.python_status = QLabel("Python: aguardando verificação")
         self.python_status.setObjectName("statusNeutral")
+        self.python_status.setWordWrap(True)
 
         self.git_status = QLabel("Git: aguardando verificação")
         self.git_status.setObjectName("statusNeutral")
+        self.git_status.setWordWrap(True)
 
         self.driver_status = QLabel("Driver: aguardando verificação")
         self.driver_status.setObjectName("statusNeutral")
+        self.driver_status.setWordWrap(True)
 
         self.prereq_message = QLabel("Clique em executar verificação para continuar.")
         self.prereq_message.setWordWrap(True)
@@ -479,6 +572,8 @@ class InstallerWindow(QMainWindow):
         layout.addStretch()
 
         buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+
         back_button = self._make_button("Voltar", "secondaryButton")
         run_button = self._make_button("Executar verificação", "primaryButton")
         self.prereq_next_button = self._make_button("Continuar", "primaryButton")
@@ -505,7 +600,7 @@ class InstallerWindow(QMainWindow):
         form_box = self._make_info_box([])
         form_layout = QFormLayout()
         form_layout.setContentsMargins(0, 0, 0, 0)
-        form_layout.setSpacing(14)
+        form_layout.setSpacing(10)
 
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("http://127.0.0.1:8000")
@@ -523,6 +618,8 @@ class InstallerWindow(QMainWindow):
         layout.addStretch()
 
         buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+
         back_button = self._make_button("Voltar", "secondaryButton")
         validate_button = self._make_button("Validar URL", "primaryButton")
         self.url_next_button = self._make_button("Continuar", "primaryButton")
@@ -549,7 +646,7 @@ class InstallerWindow(QMainWindow):
         form_box = self._make_info_box([])
         form_layout = QFormLayout()
         form_layout.setContentsMargins(0, 0, 0, 0)
-        form_layout.setSpacing(14)
+        form_layout.setSpacing(10)
 
         self.login_input = QLineEdit()
         self.password_input = QLineEdit()
@@ -580,6 +677,8 @@ class InstallerWindow(QMainWindow):
         layout.addStretch()
 
         buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+
         back_button = self._make_button("Voltar", "secondaryButton")
         register_button = self._make_button("Autenticar e cadastrar", "primaryButton")
 
@@ -603,14 +702,14 @@ class InstallerWindow(QMainWindow):
         self.loading_status = QLabel("Aguarde...")
         self.loading_status.setAlignment(Qt.AlignCenter)
         self.loading_status.setWordWrap(True)
-        self.loading_status.setStyleSheet("font-size: 15px; font-weight: 600; color: white;")
+        self.loading_status.setStyleSheet("font-size: 13px; font-weight: 700; color: white;")
 
         self.loading_bar = QProgressBar()
         self.loading_bar.setRange(0, 0)
         self.loading_bar.setTextVisible(False)
 
         box.layout().addWidget(self.loading_status)
-        box.layout().addSpacing(8)
+        box.layout().addSpacing(4)
         box.layout().addWidget(self.loading_bar)
 
         layout.addStretch()
@@ -625,25 +724,37 @@ class InstallerWindow(QMainWindow):
             "Esta máquina já está configurada como runner. Aqui você acompanha os dados locais, os bots registrados e o estado do serviço do Windows.",
         )
 
-        self.dashboard_summary = QLabel("Aguardando leitura da configuração local...")
-        self.dashboard_summary.setWordWrap(True)
-        self.dashboard_summary.setObjectName("infoText")
+        self.dashboard_summary = QTextEdit()
+        self.dashboard_summary.setReadOnly(True)
+        self.dashboard_summary.setMinimumHeight(120)
+        self.dashboard_summary.setMaximumHeight(150)
+        self.dashboard_summary.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.dashboard_summary.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.dashboard_summary.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.dashboard_summary.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
         self.dashboard_config_status = QLabel("Status local: aguardando")
         self.dashboard_config_status.setObjectName("statusNeutral")
+        self.dashboard_config_status.setWordWrap(True)
 
         self.dashboard_service_status = QLabel("Serviço: aguardando consulta")
         self.dashboard_service_status.setObjectName("statusNeutral")
+        self.dashboard_service_status.setWordWrap(True)
 
         self.dashboard_bots = QTextEdit()
         self.dashboard_bots.setReadOnly(True)
-        self.dashboard_bots.setMinimumHeight(180)
+        self.dashboard_bots.setMinimumHeight(170)
+        self.dashboard_bots.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.dashboard_bots.setLineWrapMode(QTextEdit.WidgetWidth)
 
         self.dashboard_operation = QLabel("Nenhuma operação executada ainda.")
         self.dashboard_operation.setWordWrap(True)
         self.dashboard_operation.setObjectName("statusNeutral")
 
         summary_box = self._make_info_box([])
+        summary_title = QLabel("Dados locais do runner")
+        summary_title.setObjectName("sectionTitle")
+        summary_box.layout().addWidget(summary_title)
         summary_box.layout().addWidget(self.dashboard_summary)
         summary_box.layout().addWidget(self.dashboard_config_status)
         summary_box.layout().addWidget(self.dashboard_service_status)
@@ -652,48 +763,28 @@ class InstallerWindow(QMainWindow):
         bots_title = QLabel("Bots registrados nesta máquina")
         bots_title.setObjectName("sectionTitle")
         bots_box.layout().addWidget(bots_title)
-        bots_box.layout().addWidget(self.dashboard_bots)
+        bots_box.layout().addWidget(self.dashboard_bots, 1)
 
         operation_box = self._make_info_box([])
+        operation_title = QLabel("Última operação")
+        operation_title.setObjectName("sectionTitle")
+        operation_box.layout().addWidget(operation_title)
         operation_box.layout().addWidget(self.dashboard_operation)
 
         layout.addWidget(summary_box)
-        layout.addWidget(bots_box)
+        layout.addWidget(bots_box, 1)
         layout.addWidget(operation_box)
-        layout.addStretch()
-
-        buttons = QHBoxLayout()
-        self.dashboard_refresh_button = self._make_button("Atualizar status", "secondaryButton")
-        self.dashboard_install_button = self._make_button("Instalar serviço", "successButton")
-        self.dashboard_start_button = self._make_button("Iniciar serviço", "primaryButton")
-        self.dashboard_stop_button = self._make_button("Parar serviço", "secondaryButton")
-        self.dashboard_restart_button = self._make_button("Reiniciar serviço", "primaryButton")
-        close_button = self._make_button("Fechar", "secondaryButton")
-
-        self.dashboard_refresh_button.clicked.connect(self._refresh_dashboard)
-        self.dashboard_install_button.clicked.connect(self._install_service_from_dashboard)
-        self.dashboard_start_button.clicked.connect(lambda: self._execute_service_action("start"))
-        self.dashboard_stop_button.clicked.connect(lambda: self._execute_service_action("stop"))
-        self.dashboard_restart_button.clicked.connect(lambda: self._execute_service_action("restart"))
-        close_button.clicked.connect(self.close)
-
-        buttons.addWidget(self.dashboard_refresh_button)
-        buttons.addStretch()
-        buttons.addWidget(self.dashboard_install_button)
-        buttons.addWidget(self.dashboard_start_button)
-        buttons.addWidget(self.dashboard_stop_button)
-        buttons.addWidget(self.dashboard_restart_button)
-        buttons.addWidget(close_button)
-        layout.addLayout(buttons)
 
         return page
 
     def _make_info_box(self, lines: list[str]) -> QFrame:
         box = QFrame()
         box.setObjectName("contentCard")
+        box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(6)
 
         for line in lines:
             label = QLabel(f"• {line}")
@@ -703,10 +794,26 @@ class InstallerWindow(QMainWindow):
 
         return box
 
-    def _make_button(self, text: str, object_name: str) -> QPushButton:
+    def _make_button(self, text: str, object_name: str, icon_type: str | None = None) -> QPushButton:
         button = QPushButton(text)
         button.setObjectName(object_name)
         button.setCursor(Qt.PointingHandCursor)
+        button.setMinimumHeight(28)
+        button.setMaximumHeight(28)
+        button.setIconSize(QSize(14, 14))
+
+        icon_map = {
+            "refresh": self.style().standardIcon(QStyle.SP_BrowserReload),
+            "install": self.style().standardIcon(QStyle.SP_FileDialogDetailedView),
+            "start": self.style().standardIcon(QStyle.SP_MediaPlay),
+            "stop": self.style().standardIcon(QStyle.SP_MediaStop),
+            "restart": self.style().standardIcon(QStyle.SP_BrowserReload),
+            "close": self.style().standardIcon(QStyle.SP_DialogCloseButton),
+        }
+
+        if icon_type and icon_type in icon_map:
+            button.setIcon(icon_map[icon_type])
+
         return button
 
     def _load_initial_state(self) -> None:
@@ -733,6 +840,8 @@ class InstallerWindow(QMainWindow):
 
         for index, widget in enumerate(self.step_widgets):
             widget.set_state(active=(index == step), completed=(index < step))
+
+        self.left_action_panel.setVisible(step == 5)
 
         titles = {
             0: ("Assistente de Cadastro do Worker", "Inicie a configuração deste computador."),
@@ -883,7 +992,7 @@ class InstallerWindow(QMainWindow):
         self._load_local_models()
 
         if not self._is_machine_already_configured() or self.existing_runner is None:
-            self.dashboard_summary.setText(
+            self.dashboard_summary.setPlainText(
                 "Esta máquina ainda não possui auth.json e runner.json válidos. Faça o cadastro pelo assistente."
             )
             self._set_status_label(self.dashboard_config_status, "Status local: worker não configurado.", ok=False)
@@ -901,7 +1010,7 @@ class InstallerWindow(QMainWindow):
         auth = self.existing_auth
         bots_registry = self.existing_bots or BotsRegistry()
 
-        self.dashboard_summary.setText(
+        summary_text = (
             f"Máquina: {runner.host_name}\n"
             f"Nome do runner: {runner.name}\n"
             f"Label: {runner.label}\n"
@@ -909,6 +1018,8 @@ class InstallerWindow(QMainWindow):
             f"UUID: {runner.uuid}\n"
             f"Backend: {auth.base_url if auth else '-'}"
         )
+        self.dashboard_summary.setPlainText(summary_text)
+
         self._set_status_label(
             self.dashboard_config_status,
             "Status local: esta máquina já está configurada como runner.",
@@ -925,25 +1036,103 @@ class InstallerWindow(QMainWindow):
         else:
             self._set_status_label(self.dashboard_operation, "Status atualizado com sucesso.", ok=True)
 
+    def _parse_version_key(self, version: str | None) -> tuple[int, ...]:
+        if not version:
+            return (0,)
+        numbers = re.findall(r"\d+", str(version))
+        if not numbers:
+            return (0,)
+        return tuple(int(n) for n in numbers)
+
+    def _normalize_text(self, value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    def _build_bot_identity_key(self, bot: Any) -> tuple[str, str]:
+        """
+        Gera uma chave estável para agrupar bots repetidos.
+        Prioridade:
+        1. bot_id
+        2. repository_url
+        3. nome
+        """
+        bot_id = getattr(bot, "bot_id", None)
+        repository_url = self._normalize_text(getattr(bot, "repository_url", None))
+        name = self._normalize_text(getattr(bot, "name", None))
+
+        if bot_id not in (None, "", 0):
+            return ("bot_id", str(bot_id))
+
+        if repository_url:
+            return ("repo_name", f"{repository_url}|{name}")
+
+        return ("name", name)
+
+    def _pick_latest_bot_versions(self, bots_registry: BotsRegistry) -> list[Any]:
+        """
+        Mantém só um item por bot lógico.
+        Sempre escolhe a maior versão encontrada.
+        Se a versão empatar, mantém a última entrada.
+        """
+        latest_by_key: dict[tuple[str, str], Any] = {}
+
+        for bot in bots_registry.bots:
+            identity_key = self._build_bot_identity_key(bot)
+            current_version = self._parse_version_key(getattr(bot, "installed_version", None))
+
+            saved_bot = latest_by_key.get(identity_key)
+            if saved_bot is None:
+                latest_by_key[identity_key] = bot
+                continue
+
+            saved_version = self._parse_version_key(getattr(saved_bot, "installed_version", None))
+
+            if current_version >= saved_version:
+                latest_by_key[identity_key] = bot
+
+        result = list(latest_by_key.values())
+        result.sort(
+            key=lambda item: (
+                self._normalize_text(getattr(item, "name", None)),
+                self._normalize_text(getattr(item, "repository_url", None)),
+                str(getattr(item, "bot_id", 0)),
+            )
+        )
+        return result
+
     def _update_bots_text(self, bots_registry: BotsRegistry) -> None:
         if not bots_registry.bots:
             self.dashboard_bots.setPlainText("Nenhum bot registrado localmente nesta máquina.")
             return
 
-        lines: list[str] = []
-        for index, bot in enumerate(bots_registry.bots, start=1):
-            lines.append(
-                f"{index}. {bot.name or 'Sem nome'} | bot_id={bot.bot_id} | "
-                f"versão={bot.installed_version or '-'} | status_instalação={bot.last_install_status or '-'}"
-            )
-            if bot.local_path:
-                lines.append(f"   local_path: {bot.local_path}")
-            if bot.venv_path:
-                lines.append(f"   venv_path: {bot.venv_path}")
-            if bot.repository_url:
-                lines.append(f"   repository_url: {bot.repository_url}")
+        latest_bots = self._pick_latest_bot_versions(bots_registry)
 
-        self.dashboard_bots.setPlainText("\n".join(lines))
+        if not latest_bots:
+            self.dashboard_bots.setPlainText("Nenhum bot registrado localmente nesta máquina.")
+            return
+
+        lines: list[str] = []
+        for index, bot in enumerate(latest_bots, start=1):
+            lines.append(
+                f"{index}. {getattr(bot, 'name', None) or 'Sem nome'} | "
+                f"bot_id={getattr(bot, 'bot_id', '-') or '-'} | "
+                f"versão={getattr(bot, 'installed_version', None) or '-'} | "
+                f"status_instalação={getattr(bot, 'last_install_status', None) or '-'}"
+            )
+
+            local_path = getattr(bot, "local_path", None)
+            venv_path = getattr(bot, "venv_path", None)
+            repository_url = getattr(bot, "repository_url", None)
+
+            if local_path:
+                lines.append(f"   local_path: {local_path}")
+            if venv_path:
+                lines.append(f"   venv_path: {venv_path}")
+            if repository_url:
+                lines.append(f"   repository_url: {repository_url}")
+
+            lines.append("")
+
+        self.dashboard_bots.setPlainText("\n".join(lines).strip())
 
     def _update_service_status(self) -> None:
         status = get_service_status()
@@ -974,7 +1163,12 @@ class InstallerWindow(QMainWindow):
             self.dashboard_stop_button.setEnabled(status.state not in {"stopped", "stop_pending"})
             self.dashboard_restart_button.setEnabled(status.state not in {"start_pending", "stop_pending"})
         else:
-            self._set_status_label(self.dashboard_service_status, f"Serviço: {status.state}.", ok=None, warning=True)
+            self._set_status_label(
+                self.dashboard_service_status,
+                f"Serviço: {status.state}.",
+                ok=None,
+                warning=True,
+            )
             self.dashboard_start_button.setEnabled(True)
             self.dashboard_stop_button.setEnabled(True)
             self.dashboard_restart_button.setEnabled(True)
@@ -1013,13 +1207,13 @@ class InstallerWindow(QMainWindow):
             QMessageBox.warning(self, "Operação com retorno de erro", output or "A operação não retornou sucesso.")
 
 
-
 def run_installer_app() -> None:
     app = QApplication.instance() or QApplication([])
 
-    font = QFont("Segoe UI", 10)
+    font = QFont("Segoe UI", 9)
     app.setFont(font)
 
     window = InstallerWindow()
     window.show()
     app.exec()
+    
