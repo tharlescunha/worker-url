@@ -30,6 +30,8 @@ from app.core.json_store import save_model
 from app.core.machine_info import collect_machine_info
 from app.core.paths import create_worker_structure
 from app.core.security import protect_text
+from app.installer.runtime_setup import install_or_update_worker_runtime
+from app.service.service_files import generate_service_files
 
 LOGIN_PATH = "/api/v1/auth/login"
 REGISTER_RUNNER_PATH = "/api/v1/worker/registration/"
@@ -248,8 +250,16 @@ def run_registration_flow(
     notify("Salvando registro local de bots...")
     persist_bots_registry(register_response)
 
+    notify("Preparando worker-runtime...")
+    runtime_result = install_or_update_worker_runtime()
+
+    notify("Gerando arquivos do serviço...")
+    service_files = generate_service_files()
+
     notify("Cadastro concluído com sucesso.")
     return {
         "auth": auth_response,
         "runner": register_response,
+        "runtime": runtime_result.__dict__,
+        "service_files": service_files,
     }

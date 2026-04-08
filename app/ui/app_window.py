@@ -957,17 +957,22 @@ class InstallerWindow(QMainWindow):
 
         install_messages: list[str] = []
 
-        try:
-            files = generate_service_files()
+        runtime_info = result.get("runtime") or {}
+        service_files = result.get("service_files") or {}
+
+        if runtime_info:
             install_messages.append(
-                "Arquivos do serviço gerados com sucesso em: "
-                f"{files['install_service_bat']}"
+                "Worker-runtime preparado com sucesso.\n"
+                f"repo: {runtime_info.get('local_path', '-')}\n"
+                f"venv: {runtime_info.get('venv_path', '-')}\n"
+                f"mensagem: {runtime_info.get('message', '-')}"
             )
-        except Exception as exc:
-            install_messages.append(f"Falha ao gerar arquivos do serviço: {exc}")
-            self._refresh_dashboard(operation_message="\n".join(install_messages))
-            self._go_to_step(5)
-            return
+
+        if service_files:
+            install_messages.append(
+                "Arquivos do serviço gerados com sucesso em:\n"
+                f"{service_files.get('install_service_bat', '-')}"
+            )
 
         success, output = install_service()
         if success:
@@ -1216,4 +1221,3 @@ def run_installer_app() -> None:
     window = InstallerWindow()
     window.show()
     app.exec()
-    

@@ -1,27 +1,6 @@
-# app\service\service_files.py
-
-"""
-Geração dos arquivos do serviço Windows.
-
-Agora também gera:
-- install_worker_service.bat
-- start_worker.bat
-- stop_worker.bat
-- restart_worker.bat
-- diagnostic_worker.bat
-
-Ajuste importante:
-- o instalador tenta usar o Python atual
-- se existir PYTHON_HOME, usa esse valor
-- configura o serviço para iniciar automaticamente
-"""
-
 from __future__ import annotations
 
-import os
-import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
 from app.core.config_models import WorkerServiceConfig
 from app.core.constants import (
@@ -39,30 +18,27 @@ from app.core.constants import (
     STOP_SERVICE_BAT,
 )
 from app.core.json_store import save_model
-
-
-def _project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
-def _resolve_python_executable() -> str:
-    env_python = os.environ.get("PYTHON_HOME", "").strip()
-    if env_python:
-        return env_python
-    return sys.executable
+from app.installer.runtime_setup import (
+    WORKER_RUNTIME_BRANCH,
+    get_worker_runtime_dir,
+    get_worker_runtime_venv_dir,
+)
 
 
 def generate_service_files() -> dict[str, str]:
-    project_root = _project_root()
-    python_executable = _resolve_python_executable()
-    working_directory = str(project_root)
+    runtime_dir = get_worker_runtime_dir()
+    runtime_venv_dir = get_worker_runtime_venv_dir()
+
+    python_executable = str(runtime_venv_dir / "Scripts" / "python.exe")
+    working_directory = str(runtime_dir)
     runtime_module = "app.runtime.main"
+    runtime_branch = WORKER_RUNTIME_BRANCH.strip() or "main"
 
     service_config = WorkerServiceConfig(
         service_name=SERVICE_NAME,
         display_name=SERVICE_DISPLAY_NAME,
         description=SERVICE_DESCRIPTION,
-        project_root=str(project_root),
+        project_root=working_directory,
         working_directory=working_directory,
         python_executable=python_executable,
         runtime_module=runtime_module,
@@ -92,7 +68,12 @@ if not exist "%NSSM_EXE%" (
 )
 
 if not exist "%PYTHON_EXE%" (
-    echo Python nao encontrado em %PYTHON_EXE%
+    echo Python do runtime nao encontrado em %PYTHON_EXE%
+    exit /b 1
+)
+
+if not exist "%WORK_DIR%" (
+    echo Pasta do runtime nao encontrada em %WORK_DIR%
     exit /b 1
 )
 
@@ -120,7 +101,46 @@ exit /b 0
 """
 
     start_content = f"""@echo off
-sc start "{SERVICE_NAME}"
+setlocal
+
+set WORK_DIR={working_directory}
+set PYTHON_EXE={python_executable}
+set SERVICE_NAME={SERVICE_NAME}
+set RUNTIME_BRANCH={runtime_branch}
+
+if not exist "%WORK_DIR%" (
+    echo Pasta do runtime nao encontrada em %WORK_DIR%
+    exit /b 1
+)
+
+cd /d "%WORK_DIR%"
+
+git fetch --all --tags --prune
+if errorlevel 1 exit /b 1
+
+git checkout --force "%RUNTIME_BRANCH%"
+if errorlevel 1 exit /b 1
+
+git reset --hard origin/%RUNTIME_BRANCH%
+if errorlevel 1 exit /b 1
+
+git clean -fd
+if errorlevel 1 exit /b 1
+
+if not exist "%PYTHON_EXE%" (
+    echo Python da venv do runtime nao encontrado em %PYTHON_EXE%
+    exit /b 1
+)
+
+"%PYTHON_EXE%" -m pip install --upgrade pip
+if errorlevel 1 exit /b 1
+
+if exist "requirements.txt" (
+    "%PYTHON_EXE%" -m pip install -r requirements.txt
+    if errorlevel 1 exit /b 1
+)
+
+sc start "%SERVICE_NAME%"
 """
 
     stop_content = f"""@echo off
@@ -128,19 +148,63 @@ sc stop "{SERVICE_NAME}"
 """
 
     restart_content = f"""@echo off
+setlocal
+
 sc stop "{SERVICE_NAME}"
 timeout /t 2 >nul
-sc start "{SERVICE_NAME}"
+
+set WORK_DIR={working_directory}
+set PYTHON_EXE={python_executable}
+set SERVICE_NAME={SERVICE_NAME}
+set RUNTIME_BRANCH={runtime_branch}
+
+if not exist "%WORK_DIR%" (
+    echo Pasta do runtime nao encontrada em %WORK_DIR%
+    exit /b 1
+)
+
+cd /d "%WORK_DIR%"
+
+git fetch --all --tags --prune
+if errorlevel 1 exit /b 1
+
+git checkout --force "%RUNTIME_BRANCH%"
+if errorlevel 1 exit /b 1
+
+git reset --hard origin/%RUNTIME_BRANCH%
+if errorlevel 1 exit /b 1
+
+git clean -fd
+if errorlevel 1 exit /b 1
+
+if not exist "%PYTHON_EXE%" (
+    echo Python da venv do runtime nao encontrado em %PYTHON_EXE%
+    exit /b 1
+)
+
+"%PYTHON_EXE%" -m pip install --upgrade pip
+if errorlevel 1 exit /b 1
+
+if exist "requirements.txt" (
+    "%PYTHON_EXE%" -m pip install -r requirements.txt
+    if errorlevel 1 exit /b 1
+)
+
+sc start "%SERVICE_NAME%"
 """
 
     diagnostic_content = f"""@echo off
 echo === SERVICE QUERY ===
 sc query "{SERVICE_NAME}"
 echo.
+echo === WORK DIR ===
+echo {working_directory}
+echo.
 echo === PYTHON ===
 "{python_executable}" --version
 echo.
 echo === RUNTIME TEST ===
+cd /d "{working_directory}"
 "{python_executable}" -m {runtime_module}
 """
 
