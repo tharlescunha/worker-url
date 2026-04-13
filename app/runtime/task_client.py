@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.core.constants import RUNTIME_EVENT_PATH
 from app.core.http_client import HttpClient
 
 
@@ -218,4 +219,65 @@ class TaskApiClient:
             RESOLVE_CREDENTIAL_PATH.format(credential_id=credential_id),
             payload,
         )
-    
+
+    def send_runtime_event(
+        self,
+        *,
+        event_type: str,
+        task_id: int | None = None,
+        automation_id: int | None = None,
+        bot_id: int | str | None = None,
+        execution_mode: str | None = None,
+        reason: str | None = None,
+        message: str | None = None,
+        extra_payload: dict | None = None,
+    ) -> dict:
+        payload = self._auth_payload()
+        payload["event_type"] = event_type
+        payload["task_id"] = task_id
+        payload["automation_id"] = automation_id
+        payload["bot_id"] = bot_id
+        payload["execution_mode"] = execution_mode
+        payload["reason"] = reason
+        payload["message"] = message
+
+        if extra_payload:
+            payload.update(extra_payload)
+
+        return self.client.post(RUNTIME_EVENT_PATH, payload)
+
+    def try_send_runtime_event(
+        self,
+        *,
+        event_type: str,
+        task_id: int | None = None,
+        automation_id: int | None = None,
+        bot_id: int | str | None = None,
+        execution_mode: str | None = None,
+        reason: str | None = None,
+        message: str | None = None,
+        extra_payload: dict | None = None,
+        logger=None,
+    ) -> bool:
+        try:
+            self.send_runtime_event(
+                event_type=event_type,
+                task_id=task_id,
+                automation_id=automation_id,
+                bot_id=bot_id,
+                execution_mode=execution_mode,
+                reason=reason,
+                message=message,
+                extra_payload=extra_payload,
+            )
+            return True
+        except Exception as exc:
+            if logger is not None:
+                logger.warning(
+                    "Falha ao enviar runtime_event | event_type=%s task_id=%s erro=%s",
+                    event_type,
+                    task_id,
+                    exc,
+                )
+            return False
+        

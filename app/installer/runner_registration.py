@@ -31,6 +31,7 @@ from app.core.machine_info import collect_machine_info
 from app.core.paths import create_worker_structure
 from app.core.security import protect_text
 from app.installer.runtime_setup import install_or_update_worker_runtime
+from app.runtime.interactive_agent_scheduler import install_interactive_agent_task
 from app.service.service_files import generate_service_files
 
 LOGIN_PATH = "/api/v1/auth/login"
@@ -116,11 +117,10 @@ def persist_runner_data(response: dict, installer_input: InstallerInput, machine
     runner_uuid = response.get("uuid")
 
     if not runner_id or not runner_uuid:
-        raise RunnerRegistrationError("A resposta do worker/register não trouxe runner_id e uuid.")
+        raise RunnerRegistrationError("Resposta inválida do backend (runner_id/uuid).")
 
     runner_config = RunnerConfigData(
         max_concurrency=response.get("max_concurrency", 1),
-        allowed_parallel_bots={},
         polling_interval=response.get("polling_interval", 10),
         auto_update_bots=True,
         install_all_bots_on_register=False,
@@ -143,9 +143,6 @@ def persist_runner_data(response: dict, installer_input: InstallerInput, machine
         status=response.get("status", "offline"),
         token_hash="",
         runner_token=runner_token,
-        created_at=None,
-        updated_at=None,
-        last_heartbeat=None,
         config=runner_config,
     )
 
@@ -165,25 +162,13 @@ def persist_bots_registry(response: dict) -> None:
             BotRegistryItem(
                 bot_id=bot_id,
                 name=bot.get("name", ""),
-                technology=bot.get("technology"),
-                source_type=bot.get("source_type"),
                 repository_url=bot.get("repository_url") or bot.get("source_url"),
-                artifact_path=bot.get("artifact_path"),
-                branch=bot.get("branch"),
                 entrypoint=bot.get("entrypoint"),
                 requirements_file=bot.get("requirements_file"),
                 timeout_default=bot.get("timeout_default"),
-                checksum=bot.get("checksum"),
                 expected_version=bot.get("version"),
                 expected_commit=bot.get("commit_hash"),
-                local_path="",
-                venv_path="",
-                installed_version=None,
-                installed_commit=None,
-                requirements_hash=None,
-                last_install_status="not_installed",
-                last_install_message="Bot ainda não baixado localmente.",
-                linked=True,
+                execution_mode=bot.get("execution_mode", "background"),
             )
         )
 
@@ -200,7 +185,7 @@ def run_registration_flow(
 
     validate_installer_input(installer_input)
 
-    notify("Autenticando no sistema...")
+    notify("Autenticando...")
     client = HttpClient(base_url=installer_input.base_url)
 
     auth_response = authenticate_user(
@@ -210,56 +195,51 @@ def run_registration_flow(
     )
 
     access_token = auth_response.get("access_token")
-    refresh_token = auth_response.get("refresh_token")
-    token_type = auth_response.get("token_type", "bearer")
-
     if not access_token:
-        raise RunnerRegistrationError("O login não retornou access_token.")
+        raise RunnerRegistrationError("Login não retornou access_token.")
 
     client.set_token(access_token)
 
-    notify("Coletando informações da máquina...")
+    notify("Coletando dados da máquina...")
     machine = collect_machine_info()
 
-    notify("Registrando a máquina no backend...")
-    register_response = register_runner(
-        client=client,
-        installer_input=installer_input,
-        machine=machine,
-    )
+    notify("Registrando runner...")
+    register_response = register_runner(client, installer_input, machine)
 
-    notify("Criando estrutura local do worker...")
+    notify("Criando estrutura local...")
     create_worker_structure()
 
-    notify("Salvando autenticação protegida...")
+    notify("Salvando autenticação...")
     persist_auth_data(
         base_url=installer_input.base_url,
         login=installer_input.login,
         access_token=access_token,
-        refresh_token=refresh_token,
-        token_type=token_type,
+        refresh_token=auth_response.get("refresh_token"),
+        token_type=auth_response.get("token_type"),
     )
 
-    notify("Salvando dados do runner...")
-    persist_runner_data(
-        response=register_response,
-        installer_input=installer_input,
-        machine=machine,
-    )
+    notify("Salvando runner...")
+    persist_runner_data(register_response, installer_input, machine)
 
-    notify("Salvando registro local de bots...")
+    notify("Salvando bots...")
     persist_bots_registry(register_response)
 
-    notify("Preparando worker-runtime...")
+    notify("Preparando runtime...")
     runtime_result = install_or_update_worker_runtime()
 
-    notify("Gerando arquivos do serviço...")
+    notify("Gerando arquivos do serviço e agente...")
     service_files = generate_service_files()
 
-    notify("Cadastro concluído com sucesso.")
+    notify("Instalando agente interativo...")
+    agent_ok, agent_output = install_interactive_agent_task()
+
+    notify("Concluído com sucesso.")
+
     return {
-        "auth": auth_response,
-        "runner": register_response,
         "runtime": runtime_result.__dict__,
         "service_files": service_files,
+        "interactive_agent_install": {
+            "success": agent_ok,
+            "output": agent_output,
+        },
     }

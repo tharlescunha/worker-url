@@ -25,6 +25,15 @@ class RunnerConfigData(BaseModel):
     install_all_bots_on_register: bool = False
     maintenance_mode: bool = False
 
+    # novos campos para foreground / agente interativo
+    foreground_enabled: bool = True
+    foreground_max_concurrency: int = Field(default=1, ge=1)
+    interactive_agent_required: bool = True
+    interactive_agent_heartbeat_ttl_seconds: int = Field(default=20, ge=5)
+    interactive_agent_poll_interval_seconds: int = Field(default=2, ge=1)
+    interactive_agent_result_poll_interval_seconds: int = Field(default=1, ge=1)
+    interactive_agent_result_ttl_hours: int = Field(default=24, ge=1)
+
 
 class RunnerData(BaseModel):
     id: int
@@ -77,6 +86,9 @@ class BotRegistryItem(BaseModel):
     last_install_status: str | None = None
     last_install_message: str | None = None
     linked: bool = True
+
+    # novo campo vindo do backend / sync do bot
+    execution_mode: str = "background"
 
 
 class BotsRegistry(BaseModel):
