@@ -31,7 +31,7 @@ def generate_interactive_agent_files() -> dict[str, str]:
     INTERACTIVE_AGENT_SCRIPT.parent.mkdir(parents=True, exist_ok=True)
     INSTALL_INTERACTIVE_AGENT_BAT.parent.mkdir(parents=True, exist_ok=True)
 
-    script_content = f'''from app.runtime.interactive_agent import main
+    script_content = '''from app.runtime.interactive_agent import main
 
 if __name__ == "__main__":
     main()
@@ -92,6 +92,7 @@ schtasks /Create ^
  /TN "%TASK_NAME%" ^
  /TR "wscript.exe ""%VBS_PATH%""" ^
  /RL HIGHEST ^
+ /IT ^
  /F ^
  /RU "%CURRENT_USER%"
 
@@ -125,6 +126,9 @@ echo {str(INTERACTIVE_AGENT_SCRIPT)}
 echo.
 echo === VBS ===
 echo {str(INTERACTIVE_AGENT_VBS)}
+echo.
+echo === QUERY SESSION ===
+query session
 '''
 
     INTERACTIVE_AGENT_SCRIPT.write_text(script_content, encoding="utf-8")

@@ -57,7 +57,12 @@ class InteractiveAgent:
         INTERACTIVE_AGENT_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     def run(self) -> None:
-        self.logger.info("Agente interativo iniciado | pid=%s", self.pid)
+        self.logger.info(
+            "Agente interativo iniciado | pid=%s session_id=%s username=%s",
+            self.pid,
+            self._get_session_id(),
+            self._get_username(),
+        )
 
         while True:
             try:
@@ -171,6 +176,30 @@ class InteractiveAgent:
         if not payload_file.exists():
             raise RuntimeError(f"Arquivo de payload não encontrado: {payload_file}")
 
+        validation = self._validate_interactive_context()
+        if not validation["ok"]:
+            message = str(validation["message"])
+            self.logger.warning(
+                "Execução foreground bloqueada por contexto interativo inválido | "
+                "request_id=%s task_id=%s motivo=%s",
+                execution_request_id,
+                task_id,
+                message,
+            )
+            return {
+                "success": False,
+                "status": "error",
+                "final_message": message,
+                "execution_request_id": execution_request_id,
+                "stdout_text": None,
+                "stderr_text": message,
+                "exit_code": None,
+                "started_at": datetime.now(UTC).isoformat(),
+                "finished_at": datetime.now(UTC).isoformat(),
+                "duration_seconds": 0,
+                "interactive_context": validation,
+            }
+
         env = os.environ.copy()
         extra_env = request_payload.get("environment") or {}
         if isinstance(extra_env, dict):
@@ -179,6 +208,10 @@ class InteractiveAgent:
 
         env["ORKAFLOW_EXECUTION_MODE"] = EXECUTION_MODE_FOREGROUND
         env["ORKAFLOW_INTERACTIVE_AGENT_PID"] = str(self.pid)
+        env["ORKAFLOW_INTERACTIVE_AGENT_SESSION_ID"] = str(self._get_session_id() or "")
+        env["ORKAFLOW_INTERACTIVE_ACTIVE_SESSION_ID"] = str(validation.get("active_session_id") or "")
+        env["ORKAFLOW_INTERACTIVE_SESSION_NAME"] = str(validation.get("active_session_name") or "")
+        env["ORKAFLOW_INTERACTIVE_SESSION_USER"] = str(validation.get("active_session_username") or "")
 
         command = [
             str(python_executable),
@@ -189,9 +222,11 @@ class InteractiveAgent:
         started_at = datetime.now(UTC)
 
         self.logger.info(
-            "Iniciando bot foreground | request_id=%s task_id=%s command=%s",
+            "Iniciando bot foreground | request_id=%s task_id=%s agent_session_id=%s active_session_id=%s command=%s",
             execution_request_id,
             task_id,
+            self._get_session_id(),
+            validation.get("active_session_id"),
             command,
         )
 
@@ -205,6 +240,13 @@ class InteractiveAgent:
             errors="replace",
             env=env,
             shell=False,
+        )
+
+        self.logger.info(
+            "Processo foreground iniciado | request_id=%s task_id=%s child_pid=%s",
+            execution_request_id,
+            task_id,
+            process.pid,
         )
 
         try:
@@ -224,6 +266,7 @@ class InteractiveAgent:
                 "started_at": started_at.isoformat(),
                 "finished_at": finished_at.isoformat(),
                 "duration_seconds": round((finished_at - started_at).total_seconds(), 3),
+                "interactive_context": validation,
             }
 
         finished_at = datetime.now(UTC)
@@ -244,17 +287,67 @@ class InteractiveAgent:
             "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
             "duration_seconds": round((finished_at - started_at).total_seconds(), 3),
+            "interactive_context": validation,
         }
 
+    def _validate_interactive_context(self) -> dict:
+        agent_session_id = self._get_session_id()
+        username = self._get_username()
+        active_session = self._get_active_session_details()
+        query_output = self._query_session_output()
+
+        result = {
+            "ok": True,
+            "agent_pid": self.pid,
+            "agent_session_id": agent_session_id,
+            "agent_username": username,
+            "active_session_id": active_session.get("session_id"),
+            "active_session_name": active_session.get("session_name"),
+            "active_session_username": active_session.get("username"),
+            "active_session_state": active_session.get("state"),
+            "query_session_output": query_output,
+            "message": "Contexto interativo válido.",
+        }
+
+        if not active_session.get("found"):
+            result["ok"] = False
+            result["message"] = (
+                "Nenhuma sessão ACTIVE foi encontrada no Windows. "
+                "Abra a sessão do usuário e reinicie o agente interativo nessa sessão."
+            )
+            return result
+
+        active_session_id = active_session.get("session_id")
+        if (
+            agent_session_id is not None
+            and active_session_id is not None
+            and agent_session_id != active_session_id
+        ):
+            result["ok"] = False
+            result["message"] = (
+                "O agente interativo está em uma sessão diferente da sessão ACTIVE atual. "
+                f"agent_session_id={agent_session_id} active_session_id={active_session_id}. "
+                "Reinicie o agente interativo dentro da sessão RDP/console atualmente ativa."
+            )
+            return result
+
+        return result
+
     def _write_heartbeat_state(self) -> None:
+        validation = self._validate_interactive_context()
+
         state_payload = {
-            "is_active": True,
+            "is_active": bool(validation.get("ok")),
             "pid": self.pid,
             "session_id": self._get_session_id(),
             "username": self._get_username(),
             "updated_at": datetime.now(UTC).isoformat(),
             "heartbeat_age_seconds": 0,
-            "message": "Agente interativo ativo.",
+            "message": validation.get("message") or "Agente interativo ativo.",
+            "active_session_id": validation.get("active_session_id"),
+            "active_session_name": validation.get("active_session_name"),
+            "active_session_username": validation.get("active_session_username"),
+            "active_session_state": validation.get("active_session_state"),
         }
 
         self._write_json_atomic(INTERACTIVE_AGENT_STATE_FILE, state_payload)
@@ -320,6 +413,73 @@ class InteractiveAgent:
             return int(session_id.value)
         except Exception:
             return None
+
+    def _query_session_output(self) -> str:
+        try:
+            result = subprocess.run(
+                ["query", "session"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                shell=False,
+                check=False,
+            )
+            return ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+        except Exception as exc:
+            return f"Falha ao executar 'query session': {exc}"
+
+    def _get_active_session_details(self) -> dict:
+        output = self._query_session_output()
+
+        lines = [line.rstrip() for line in output.splitlines() if line.strip()]
+        if len(lines) <= 1:
+            return {
+                "found": False,
+                "session_id": None,
+                "session_name": None,
+                "username": None,
+                "state": None,
+            }
+
+        for raw_line in lines[1:]:
+            normalized = " ".join(raw_line.split())
+            parts = normalized.split(" ")
+
+            if len(parts) < 4:
+                continue
+
+            if parts[0].startswith(">"):
+                parts[0] = parts[0].lstrip(">")
+
+            username = parts[0] if len(parts) > 0 else None
+            session_name = parts[1] if len(parts) > 1 else None
+            session_id_raw = parts[2] if len(parts) > 2 else None
+            state = parts[3] if len(parts) > 3 else None
+
+            if str(state).strip().lower() != "active":
+                continue
+
+            try:
+                session_id = int(str(session_id_raw).strip())
+            except Exception:
+                session_id = None
+
+            return {
+                "found": True,
+                "session_id": session_id,
+                "session_name": session_name,
+                "username": username,
+                "state": state,
+            }
+
+        return {
+            "found": False,
+            "session_id": None,
+            "session_name": None,
+            "username": None,
+            "state": None,
+        }
 
     def _kill_process_tree(self, pid: int) -> None:
         subprocess.run(
