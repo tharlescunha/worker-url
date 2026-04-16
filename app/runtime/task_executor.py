@@ -55,6 +55,10 @@ def get_execution_mode(task_data: dict) -> str:
     return execution_mode
 
 
+def is_interactive_worker_process() -> bool:
+    return str(os.environ.get("ORKAFLOW_WORKER_ROLE") or "").strip().lower() == "interactive"
+
+
 def can_accept_foreground_task(
     auth: AuthData,
     access_token: str,
@@ -74,6 +78,9 @@ def can_accept_foreground_task(
     execution_mode = get_execution_mode(task_data)
     if execution_mode != EXECUTION_MODE_FOREGROUND:
         return True, "Task não é foreground."
+
+    if is_interactive_worker_process():
+        return True, "Interactive worker pode aceitar task foreground diretamente."
 
     foreground_executor = ForegroundExecutor(
         task_api=api,
@@ -171,19 +178,39 @@ def execute_task(
             final_message=(
                 "Task iniciada pelo worker."
                 if execution_mode == EXECUTION_MODE_BACKGROUND
-                else "Task foreground iniciada pelo agente interativo."
+                else (
+                    "Task foreground iniciada pelo interactive worker."
+                    if is_interactive_worker_process()
+                    else "Task foreground iniciada pelo agente interativo."
+                )
             ),
         )
 
         logger.info(
-            "Task iniciada | task_id=%s execution_mode=%s",
+            "Task iniciada | task_id=%s execution_mode=%s worker_role=%s",
             task_id,
             execution_mode,
+            "interactive" if is_interactive_worker_process() else "service",
         )
 
         timeout_seconds = task_data.get("timeout_seconds") or bot.timeout_default or 300
 
         if execution_mode == EXECUTION_MODE_FOREGROUND:
+            if is_interactive_worker_process():
+                _execute_foreground_direct(
+                    api=api,
+                    runner=runner,
+                    logger=logger,
+                    task_data=task_data,
+                    python_exe=python_exe,
+                    entrypoint=entrypoint,
+                    bot=bot,
+                    task_file=task_file,
+                    timeout_seconds=timeout_seconds,
+                    execution_started_at=execution_started_at,
+                )
+                return
+
             _execute_foreground_task(
                 api=api,
                 runner=runner,
@@ -449,6 +476,270 @@ def execute_task(
                 task_file.unlink()
             except Exception:
                 logger.warning("Não foi possível remover o arquivo temporário da task: %s", task_file)
+
+
+def _execute_foreground_direct(
+    *,
+    api: TaskApiClient,
+    runner: RunnerData,
+    logger,
+    task_data: dict,
+    python_exe: Path,
+    entrypoint: Path,
+    bot: BotRegistryItem,
+    task_file: Path,
+    timeout_seconds: int,
+    execution_started_at: datetime,
+) -> None:
+    task_id = int(task_data["task_id"])
+    process: subprocess.Popen | None = None
+    telemetry_collector: ProcessTelemetryCollector | None = None
+
+    env = os.environ.copy()
+    env["ORKAFLOW_TASK_FILE"] = str(task_file)
+    env["ORKAFLOW_TASK_ID"] = str(task_id)
+    env["ORKAFLOW_AUTOMATION_ID"] = str(task_data.get("automation_id") or "")
+    env["ORKAFLOW_RUNNER_ID"] = str(runner.id)
+    env["ORKAFLOW_RUNNER_UUID"] = runner.uuid
+    env["ORKAFLOW_EXECUTION_MODE"] = EXECUTION_MODE_FOREGROUND
+    env["ORKAFLOW_WORKER_ROLE"] = "interactive"
+
+    command = [
+        str(python_exe),
+        str(entrypoint),
+        str(task_file),
+    ]
+
+    logger.info(
+        "Executando foreground diretamente no interactive worker | task_id=%s command=%s",
+        task_id,
+        command,
+    )
+
+    net_before = psutil.net_io_counters()
+
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(Path(bot.local_path)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            shell=False,
+        )
+
+        telemetry_collector = ProcessTelemetryCollector(process.pid)
+        telemetry_collector.start()
+
+        stdout_text, stderr_text = process.communicate(timeout=timeout_seconds)
+
+        telemetry = telemetry_collector.stop(
+            execution_started_at=execution_started_at,
+            execution_finished_at=datetime.now(UTC),
+            exit_code=process.returncode,
+            net_before=net_before,
+            net_after=psutil.net_io_counters(),
+            telemetry_status="finished" if process.returncode == 0 else "error",
+            message=(
+                "Task foreground finalizada com sucesso."
+                if process.returncode == 0
+                else f"Bot foreground finalizou com código de saída {process.returncode}."
+            ),
+            execution_mode=EXECUTION_MODE_FOREGROUND,
+        )
+
+        _log_process_output_locally(logger, task_id, stdout_text, stderr_text)
+
+        try:
+            _send_output_logs(api, task_id, stdout_text, stderr_text)
+        except Exception:
+            logger.exception("Falha ao registrar stdout/stderr foreground direto | task_id=%s", task_id)
+
+        try:
+            _send_telemetry(api, task_id, telemetry, logger)
+        except Exception:
+            logger.exception("Falha ao enviar telemetria foreground direto | task_id=%s", task_id)
+
+        if process.returncode == 0:
+            api.finish_task(
+                task_id=task_id,
+                status=TASK_STATUS_FINISHED,
+                final_message="Task foreground finalizada com sucesso.",
+                items_processed=0,
+                items_failed=0,
+            )
+            logger.info("Task foreground finalizada com sucesso | task_id=%s", task_id)
+            return
+
+        error_message = f"Bot foreground finalizou com código de saída {process.returncode}."
+        trace_text = _build_stacktrace(stderr_text, stdout_text)
+
+        try:
+            api.send_error(
+                task_id=task_id,
+                error_type="foreground_bot_exit_code",
+                message=error_message,
+                stacktrace=trace_text,
+                code=str(process.returncode),
+                is_retryable=False,
+            )
+        except Exception as exc:
+            logger.exception("Falha ao registrar erro foreground direto | task_id=%s", task_id)
+            final_message = _compose_error_final_message(
+                error_message,
+                trace_text,
+                f"Falha ao registrar task_error: {exc}",
+            )
+        else:
+            final_message = _compose_error_final_message(error_message, trace_text)
+
+        api.finish_task(
+            task_id=task_id,
+            status=TASK_STATUS_ERROR,
+            final_message=final_message,
+            items_processed=0,
+            items_failed=1,
+        )
+        logger.error("Task foreground finalizada com erro | task_id=%s returncode=%s", task_id, process.returncode)
+
+    except subprocess.TimeoutExpired:
+        if process and process.pid:
+            _kill_process_tree(process.pid)
+
+        timeout_message = "Task foreground excedeu o timeout e foi encerrada pelo interactive worker."
+
+        telemetry = None
+        if telemetry_collector is not None:
+            try:
+                telemetry = telemetry_collector.stop(
+                    execution_started_at=execution_started_at,
+                    execution_finished_at=datetime.now(UTC),
+                    exit_code=None,
+                    net_before=None,
+                    net_after=psutil.net_io_counters(),
+                    telemetry_status="timeout",
+                    message=timeout_message,
+                    execution_mode=EXECUTION_MODE_FOREGROUND,
+                )
+            except Exception:
+                logger.exception("Falha ao coletar telemetria de timeout foreground direto | task_id=%s", task_id)
+
+        if telemetry is not None:
+            try:
+                _send_telemetry(api, task_id, telemetry, logger)
+            except Exception:
+                logger.exception("Falha ao enviar telemetria de timeout foreground direto | task_id=%s", task_id)
+
+        try:
+            api.send_log(
+                task_id=task_id,
+                level=LOG_LEVEL_ERROR,
+                message=timeout_message,
+                error_type="timeout",
+            )
+        except Exception:
+            logger.exception("Falha ao registrar log de timeout foreground direto | task_id=%s", task_id)
+
+        final_message = timeout_message
+
+        try:
+            api.send_error(
+                task_id=task_id,
+                error_type="timeout",
+                message=timeout_message,
+                stacktrace="TimeoutExpired",
+                code="FOREGROUND_TIMEOUT",
+                is_retryable=False,
+            )
+        except Exception as exc:
+            logger.exception("Falha ao registrar erro de timeout foreground direto | task_id=%s", task_id)
+            final_message = _compose_error_final_message(
+                timeout_message,
+                "TimeoutExpired",
+                f"Falha ao registrar task_error: {exc}",
+            )
+        else:
+            final_message = _compose_error_final_message(timeout_message, "TimeoutExpired")
+
+        api.finish_task(
+            task_id=task_id,
+            status=TASK_STATUS_TIMEOUT,
+            final_message=final_message,
+            items_processed=0,
+            items_failed=1,
+        )
+        logger.error("Task foreground finalizada por timeout | task_id=%s", task_id)
+
+    except Exception as exc:
+        message = f"Erro ao executar task foreground diretamente: {exc}"
+        stacktrace = traceback.format_exc()
+
+        telemetry = None
+        if telemetry_collector is not None:
+            try:
+                telemetry = telemetry_collector.stop(
+                    execution_started_at=execution_started_at,
+                    execution_finished_at=datetime.now(UTC),
+                    exit_code=process.returncode if process else None,
+                    net_before=None,
+                    net_after=psutil.net_io_counters(),
+                    telemetry_status="execution_error",
+                    message=message,
+                    execution_mode=EXECUTION_MODE_FOREGROUND,
+                )
+            except Exception:
+                logger.exception("Falha ao coletar telemetria de erro foreground direto | task_id=%s", task_id)
+
+        if telemetry is not None:
+            try:
+                _send_telemetry(api, task_id, telemetry, logger)
+            except Exception:
+                logger.exception("Falha ao enviar telemetria de erro foreground direto | task_id=%s", task_id)
+
+        logger.exception("Erro ao executar task foreground diretamente | task_id=%s", task_id)
+
+        try:
+            api.send_log(
+                task_id=task_id,
+                level=LOG_LEVEL_ERROR,
+                message=message,
+                error_type="execution_error",
+            )
+        except Exception:
+            logger.exception("Falha ao registrar log de erro foreground direto | task_id=%s", task_id)
+
+        final_message = message
+
+        try:
+            api.send_error(
+                task_id=task_id,
+                error_type="execution_error",
+                message=message,
+                stacktrace=stacktrace,
+                code="FOREGROUND_EXECUTION_ERROR",
+                is_retryable=False,
+            )
+        except Exception as api_exc:
+            logger.exception("Falha ao registrar erro foreground direto | task_id=%s", task_id)
+            final_message = _compose_error_final_message(
+                message,
+                stacktrace,
+                f"Falha ao registrar task_error: {api_exc}",
+            )
+        else:
+            final_message = _compose_error_final_message(message, stacktrace)
+
+        api.finish_task(
+            task_id=task_id,
+            status=TASK_STATUS_ERROR,
+            final_message=final_message,
+            items_processed=0,
+            items_failed=1,
+        )
+        logger.error("Task foreground finalizada com erro | task_id=%s", task_id)
 
 
 def _execute_foreground_task(

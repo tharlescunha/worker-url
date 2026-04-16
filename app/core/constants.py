@@ -37,6 +37,7 @@ STOP_SERVICE_BAT = SERVICES_DIR / "stop_worker.bat"
 RESTART_SERVICE_BAT = SERVICES_DIR / "restart_worker.bat"
 DIAGNOSTIC_SERVICE_BAT = SERVICES_DIR / "diagnostic_worker.bat"
 
+# legado - interactive agent
 INTERACTIVE_AGENT_STATE_FILE = TMP_DIR / "interactive_agent_state.json"
 INTERACTIVE_AGENT_QUEUE_DIR = TMP_DIR / "interactive_agent_queue"
 INTERACTIVE_AGENT_RESULTS_DIR = TMP_DIR / "interactive_agent_results"
@@ -54,6 +55,22 @@ DIAGNOSTIC_INTERACTIVE_AGENT_BAT = SERVICES_DIR / "diagnostic_interactive_agent.
 
 INTERACTIVE_AGENT_TASK_NAME = "OrkaFlowInteractiveAgent"
 INTERACTIVE_AGENT_DISPLAY_NAME = "OrkaFlow Interactive Agent"
+
+# novo - interactive worker
+INTERACTIVE_WORKER_LOG_FILE = LOGS_DIR / "interactive_worker.log"
+INTERACTIVE_WORKER_STDOUT_LOG = LOGS_DIR / "interactive_worker_stdout.log"
+INTERACTIVE_WORKER_STDERR_LOG = LOGS_DIR / "interactive_worker_stderr.log"
+
+INTERACTIVE_WORKER_SCRIPT = RUNTIME_DIR / "interactive_worker_launcher.py"
+INTERACTIVE_WORKER_VBS = RUNTIME_DIR / "interactive_worker_launcher.vbs"
+INTERACTIVE_WORKER_TASK_XML = SERVICES_DIR / "interactive_worker_task.xml"
+INSTALL_INTERACTIVE_WORKER_BAT = SERVICES_DIR / "install_interactive_worker_task.bat"
+REMOVE_INTERACTIVE_WORKER_BAT = SERVICES_DIR / "remove_interactive_worker_task.bat"
+RUN_INTERACTIVE_WORKER_BAT = SERVICES_DIR / "run_interactive_worker.bat"
+DIAGNOSTIC_INTERACTIVE_WORKER_BAT = SERVICES_DIR / "diagnostic_interactive_worker.bat"
+
+INTERACTIVE_WORKER_TASK_NAME = "OrkaFlowInteractiveWorker"
+INTERACTIVE_WORKER_DISPLAY_NAME = "OrkaFlow Interactive Worker"
 
 DEFAULT_HTTP_TIMEOUT = 30
 INTERACTIVE_AGENT_HEARTBEAT_TTL_SECONDS = 20

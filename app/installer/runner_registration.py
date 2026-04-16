@@ -31,7 +31,10 @@ from app.core.machine_info import collect_machine_info
 from app.core.paths import create_worker_structure
 from app.core.security import protect_text
 from app.installer.runtime_setup import install_or_update_worker_runtime
-from app.runtime.interactive_agent_scheduler import install_interactive_agent_task
+from app.runtime.interactive_worker_scheduler import (
+    generate_interactive_worker_files,
+    install_interactive_worker_task,
+)
 from app.service.service_files import generate_service_files
 
 LOGIN_PATH = "/api/v1/auth/login"
@@ -227,19 +230,23 @@ def run_registration_flow(
     notify("Preparando runtime...")
     runtime_result = install_or_update_worker_runtime()
 
-    notify("Gerando arquivos do serviço e agente...")
+    notify("Gerando arquivos do serviço...")
     service_files = generate_service_files()
 
-    notify("Instalando agente interativo...")
-    agent_ok, agent_output = install_interactive_agent_task()
+    notify("Gerando arquivos do interactive worker...")
+    interactive_worker_files = generate_interactive_worker_files()
+
+    notify("Instalando interactive worker...")
+    interactive_worker_ok, interactive_worker_output = install_interactive_worker_task()
 
     notify("Concluído com sucesso.")
 
     return {
         "runtime": runtime_result.__dict__,
         "service_files": service_files,
-        "interactive_agent_install": {
-            "success": agent_ok,
-            "output": agent_output,
+        "interactive_worker_files": interactive_worker_files,
+        "interactive_worker_install": {
+            "success": interactive_worker_ok,
+            "output": interactive_worker_output,
         },
     }

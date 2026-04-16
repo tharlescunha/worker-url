@@ -33,8 +33,14 @@ class TaskApiClient:
             "token": self.runner_token,
         }
 
-    def next_task(self) -> dict:
-        return self.client.post(NEXT_TASK_PATH, self._auth_payload())
+    def next_task(self, execution_mode: str) -> dict:
+        payload = self._auth_payload()
+        payload["execution_mode"] = execution_mode
+
+        return self.client.post(
+            NEXT_TASK_PATH,
+            payload,
+        )
 
     def claim_task(self, task_id: int) -> dict:
         return self.client.post(

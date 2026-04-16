@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
 import time
 
 from app.core.config_models import AuthData, RunnerData
 from app.core.constants import (
     AUTH_FILE,
+    EXECUTION_MODE_BACKGROUND,
+    EXECUTION_MODE_FOREGROUND,
     RUNNER_FILE,
 )
 from app.core.http_client import HttpClient
@@ -102,25 +105,32 @@ def _should_skip_task_before_claim(
 ) -> tuple[bool, str]:
     execution_mode = get_execution_mode(task_data)
 
+    if execution_mode == EXECUTION_MODE_FOREGROUND:
+        return True, "Task foreground deve ser executada somente pelo interactive worker."
+
+    if execution_mode != EXECUTION_MODE_BACKGROUND:
+        return True, f"Modo de execução inválido ou não suportado pelo service worker: {execution_mode}"
+
     can_start_locally, local_reason = manager.can_start_task(task_data)
     if not can_start_locally:
         return True, local_reason
 
-    if execution_mode == "foreground":
-        can_accept, foreground_reason = can_accept_foreground_task(
-            auth=auth,
-            access_token=access_token,
-            runner=runner,
-            task_data=task_data,
-            logger=logger,
-        )
-        if not can_accept:
-            return True, foreground_reason
+    can_accept, foreground_reason = can_accept_foreground_task(
+        auth=auth,
+        access_token=access_token,
+        runner=runner,
+        task_data=task_data,
+        logger=logger,
+    )
+    if not can_accept and execution_mode == EXECUTION_MODE_FOREGROUND:
+        return True, foreground_reason
 
-    return False, "Task elegível para claim."
+    return False, "Task background elegível para claim."
 
 
 def main() -> None:
+    os.environ["ORKAFLOW_WORKER_ROLE"] = "service"
+
     logger = setup_logging()
 
     print("=== INICIANDO RUNTIME DO WORKER ===")
@@ -173,7 +183,7 @@ def main() -> None:
                 logger.warning("Falha ao enviar heartbeat: %s", exc)
 
             while manager.has_capacity(runner.config.max_concurrency):
-                next_task = task_api.next_task()
+                next_task = task_api.next_task(EXECUTION_MODE_BACKGROUND)
 
                 if not next_task.get("found"):
                     break
@@ -191,8 +201,8 @@ def main() -> None:
                 )
 
                 if should_skip:
-                    logger.warning(
-                        "Task ignorada antes do claim | task_id=%s execution_mode=%s motivo=%s",
+                    logger.info(
+                        "Task ignorada pelo service worker antes do claim | task_id=%s execution_mode=%s motivo=%s",
                         task_id,
                         execution_mode,
                         skip_reason,
@@ -219,7 +229,7 @@ def main() -> None:
                     break
 
                 logger.info(
-                    "Task enviada para execução local | task_id=%s execution_mode=%s",
+                    "Task enviada para execução local pelo service worker | task_id=%s execution_mode=%s",
                     task_id,
                     execution_mode,
                 )

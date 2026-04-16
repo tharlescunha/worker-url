@@ -521,7 +521,7 @@ class InstallerWindow(QMainWindow):
                 "Teste de conectividade com a URL do sistema",
                 "Login com usuário autorizado",
                 "Registro do runner no backend",
-                "Preparação dos arquivos locais e tentativa de instalação do serviço",
+                "Preparação do worker-runtime, do serviço e do interactive worker",
             ]
         )
         layout.addWidget(info_box)
@@ -741,6 +741,10 @@ class InstallerWindow(QMainWindow):
         self.dashboard_service_status.setObjectName("statusNeutral")
         self.dashboard_service_status.setWordWrap(True)
 
+        self.dashboard_interactive_status = QLabel("Interactive worker: instalado junto ao cadastro")
+        self.dashboard_interactive_status.setObjectName("statusNeutral")
+        self.dashboard_interactive_status.setWordWrap(True)
+
         self.dashboard_bots = QTextEdit()
         self.dashboard_bots.setReadOnly(True)
         self.dashboard_bots.setMinimumHeight(170)
@@ -758,6 +762,7 @@ class InstallerWindow(QMainWindow):
         summary_box.layout().addWidget(self.dashboard_summary)
         summary_box.layout().addWidget(self.dashboard_config_status)
         summary_box.layout().addWidget(self.dashboard_service_status)
+        summary_box.layout().addWidget(self.dashboard_interactive_status)
 
         bots_box = self._make_info_box([])
         bots_title = QLabel("Bots registrados nesta máquina")
@@ -959,6 +964,8 @@ class InstallerWindow(QMainWindow):
 
         runtime_info = result.get("runtime") or {}
         service_files = result.get("service_files") or {}
+        interactive_worker_files = result.get("interactive_worker_files") or {}
+        interactive_worker_install = result.get("interactive_worker_install") or {}
 
         if runtime_info:
             install_messages.append(
@@ -973,6 +980,25 @@ class InstallerWindow(QMainWindow):
                 "Arquivos do serviço gerados com sucesso em:\n"
                 f"{service_files.get('install_service_bat', '-')}"
             )
+
+        if interactive_worker_files:
+            install_messages.append(
+                "Arquivos do interactive worker gerados com sucesso.\n"
+                f"launcher: {interactive_worker_files.get('interactive_worker_script', '-')}\n"
+                f"instalação: {interactive_worker_files.get('install_interactive_worker_bat', '-')}"
+            )
+
+        if interactive_worker_install:
+            if interactive_worker_install.get("success"):
+                install_messages.append(
+                    "Interactive worker instalado com sucesso no logon do usuário.\n"
+                    f"detalhe: {interactive_worker_install.get('output', '-')}"
+                )
+            else:
+                install_messages.append(
+                    "Não foi possível instalar automaticamente o interactive worker.\n"
+                    f"detalhe: {interactive_worker_install.get('output', '-')}"
+                )
 
         success, output = install_service()
         if success:
@@ -1002,6 +1028,7 @@ class InstallerWindow(QMainWindow):
             )
             self._set_status_label(self.dashboard_config_status, "Status local: worker não configurado.", ok=False)
             self._set_status_label(self.dashboard_service_status, "Serviço: não consultado.", ok=None)
+            self._set_status_label(self.dashboard_interactive_status, "Interactive worker: não configurado.", ok=None)
             self.dashboard_bots.setPlainText("Nenhum bot disponível porque o worker ainda não foi configurado.")
             self.dashboard_install_button.setEnabled(False)
             self.dashboard_start_button.setEnabled(False)
@@ -1031,6 +1058,12 @@ class InstallerWindow(QMainWindow):
             ok=True,
         )
 
+        self._set_status_label(
+            self.dashboard_interactive_status,
+            "Interactive worker: configurado para iniciar no logon do usuário.",
+            ok=True,
+        )
+
         self._update_bots_text(bots_registry)
         self._update_service_status()
 
@@ -1053,13 +1086,6 @@ class InstallerWindow(QMainWindow):
         return str(value or "").strip().lower()
 
     def _build_bot_identity_key(self, bot: Any) -> tuple[str, str]:
-        """
-        Gera uma chave estável para agrupar bots repetidos.
-        Prioridade:
-        1. bot_id
-        2. repository_url
-        3. nome
-        """
         bot_id = getattr(bot, "bot_id", None)
         repository_url = self._normalize_text(getattr(bot, "repository_url", None))
         name = self._normalize_text(getattr(bot, "name", None))
@@ -1073,11 +1099,6 @@ class InstallerWindow(QMainWindow):
         return ("name", name)
 
     def _pick_latest_bot_versions(self, bots_registry: BotsRegistry) -> list[Any]:
-        """
-        Mantém só um item por bot lógico.
-        Sempre escolhe a maior versão encontrada.
-        Se a versão empatar, mantém a última entrada.
-        """
         latest_by_key: dict[tuple[str, str], Any] = {}
 
         for bot in bots_registry.bots:
@@ -1121,7 +1142,8 @@ class InstallerWindow(QMainWindow):
                 f"{index}. {getattr(bot, 'name', None) or 'Sem nome'} | "
                 f"bot_id={getattr(bot, 'bot_id', '-') or '-'} | "
                 f"versão={getattr(bot, 'installed_version', None) or '-'} | "
-                f"status_instalação={getattr(bot, 'last_install_status', None) or '-'}"
+                f"status_instalação={getattr(bot, 'last_install_status', None) or '-'} | "
+                f"modo={getattr(bot, 'execution_mode', None) or '-'}"
             )
 
             local_path = getattr(bot, "local_path", None)
@@ -1183,7 +1205,8 @@ class InstallerWindow(QMainWindow):
             files = generate_service_files()
             success, output = install_service()
             message = (
-                f"Arquivos do serviço gerados em {files['install_service_bat']}.\n\n"
+                f"Arquivos do serviço gerados em {files['install_service_bat']}.\n"
+                f"Interactive worker: {files.get('install_interactive_worker_bat', '-')}\n\n"
                 + (output or "Nenhum detalhe retornado.")
             )
             self._refresh_dashboard(operation_message=message)
@@ -1221,3 +1244,4 @@ def run_installer_app() -> None:
     window = InstallerWindow()
     window.show()
     app.exec()
+    

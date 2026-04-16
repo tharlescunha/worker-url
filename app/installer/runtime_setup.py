@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
+import subprocess
 
 from app.core.config_models import AuthData, RunnerData
 from app.core.constants import AUTH_FILE, BOTS_DIR, RUNNER_FILE, VENVS_DIR
@@ -147,11 +149,7 @@ def _ensure_runtime_venv(venv_dir: Path) -> Path:
 
     if not venv_python.exists():
         venv_dir.parent.mkdir(parents=True, exist_ok=True)
-        _run_command(
-            ["python", "-m", "venv", str(venv_dir)],
-            cwd=None,
-            error_prefix=f"Falha ao criar venv do runtime em {venv_dir}",
-        )
+        _create_venv_with_best_available_python(venv_dir)
 
     if not venv_python.exists():
         raise BotInstallError(
@@ -165,6 +163,77 @@ def _ensure_runtime_venv(venv_dir: Path) -> Path:
     )
 
     return venv_python
+
+
+def _create_venv_with_best_available_python(venv_dir: Path) -> None:
+    candidates = _get_python_launcher_candidates()
+
+    if not candidates:
+        raise BotInstallError(
+            "Nenhum interpretador Python foi encontrado para criar a venv do runtime. "
+            "Instale o Python 3.12+ e garanta que 'python' ou 'py' funcione no terminal."
+        )
+
+    errors: list[str] = []
+
+    for candidate in candidates:
+        try:
+            _run_command(
+                [*candidate, "-m", "venv", str(venv_dir)],
+                cwd=None,
+                error_prefix=f"Falha ao criar venv do runtime em {venv_dir}",
+            )
+            return
+        except Exception as exc:
+            errors.append(f"{' '.join(candidate)} -> {exc}")
+
+    details = " | ".join(errors) if errors else "sem detalhes adicionais"
+    raise BotInstallError(
+        "Não foi possível criar a venv do runtime com nenhum launcher Python disponível. "
+        f"Tentativas: {details}"
+    )
+
+
+def _get_python_launcher_candidates() -> list[list[str]]:
+    candidates: list[list[str]] = []
+
+    if shutil.which("python"):
+        candidates.append(["python"])
+
+    if shutil.which("py"):
+        candidates.append(["py", "-3.12"])
+        candidates.append(["py", "-3"])
+        candidates.append(["py"])
+
+    unique: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+
+    for item in candidates:
+        key = tuple(item)
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+
+    valid: list[list[str]] = []
+    for cmd in unique:
+        if _command_exists(cmd):
+            valid.append(cmd)
+
+    return valid
+
+
+def _command_exists(command: list[str]) -> bool:
+    try:
+        result = subprocess.run(
+            [*command, "--version"],
+            capture_output=True,
+            text=True,
+            shell=False,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
 def _install_runtime_requirements(runtime_dir: Path, venv_python: Path) -> str | None:
