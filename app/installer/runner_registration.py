@@ -31,10 +31,7 @@ from app.core.machine_info import collect_machine_info
 from app.core.paths import create_worker_structure
 from app.core.security import protect_text
 from app.installer.runtime_setup import install_or_update_worker_runtime
-from app.runtime.interactive_worker_scheduler import (
-    generate_interactive_worker_files,
-    install_interactive_worker_task,
-)
+from app.runtime.interactive_worker_scheduler import install_interactive_worker_task
 from app.service.service_files import generate_service_files
 
 LOGIN_PATH = "/api/v1/auth/login"
@@ -230,13 +227,10 @@ def run_registration_flow(
     notify("Preparando runtime...")
     runtime_result = install_or_update_worker_runtime()
 
-    notify("Gerando arquivos do serviço...")
+    notify("Gerando arquivos do serviço e do interactive worker...")
     service_files = generate_service_files()
 
-    notify("Gerando arquivos do interactive worker...")
-    interactive_worker_files = generate_interactive_worker_files()
-
-    notify("Instalando interactive worker...")
+    notify("Instalando e iniciando interactive worker...")
     interactive_worker_ok, interactive_worker_output = install_interactive_worker_task()
 
     notify("Concluído com sucesso.")
@@ -244,7 +238,15 @@ def run_registration_flow(
     return {
         "runtime": runtime_result.__dict__,
         "service_files": service_files,
-        "interactive_worker_files": interactive_worker_files,
+        "interactive_worker_files": {
+            "interactive_worker_script": service_files.get("interactive_worker_script"),
+            "interactive_worker_vbs": service_files.get("interactive_worker_vbs"),
+            "run_interactive_worker_bat": service_files.get("run_interactive_worker_bat"),
+            "install_interactive_worker_bat": service_files.get("install_interactive_worker_bat"),
+            "remove_interactive_worker_bat": service_files.get("remove_interactive_worker_bat"),
+            "diagnostic_interactive_worker_bat": service_files.get("diagnostic_interactive_worker_bat"),
+            "interactive_worker_task_name": service_files.get("interactive_worker_task_name"),
+        },
         "interactive_worker_install": {
             "success": interactive_worker_ok,
             "output": interactive_worker_output,

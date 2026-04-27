@@ -78,6 +78,7 @@ def sync_bots(client: HttpClient, runner_data) -> dict:
         current.checksum = bot_data.get("checksum")
         current.expected_version = bot_data.get("version")
         current.expected_commit = bot_data.get("commit_hash")
+        current.execution_mode = bot_data.get("execution_mode") or current.execution_mode or "background"
         current.last_sync_at = datetime.now(timezone.utc)
 
         needs_install = _needs_install(current)

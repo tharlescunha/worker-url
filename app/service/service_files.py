@@ -5,15 +5,11 @@ from datetime import datetime, timezone
 from app.core.config_models import WorkerServiceConfig
 from app.core.constants import (
     AUTH_FILE,
-    DIAGNOSTIC_INTERACTIVE_WORKER_BAT,
     DIAGNOSTIC_SERVICE_BAT,
-    INSTALL_INTERACTIVE_WORKER_BAT,
     INSTALL_SERVICE_BAT,
     LOGS_DIR,
-    REMOVE_INTERACTIVE_WORKER_BAT,
     RESTART_SERVICE_BAT,
     RUNNER_FILE,
-    RUN_INTERACTIVE_WORKER_BAT,
     SERVICE_CONFIG_FILE,
     SERVICE_DESCRIPTION,
     SERVICE_DISPLAY_NAME,
@@ -222,61 +218,6 @@ cd /d "{working_directory}"
 
     interactive_files = generate_interactive_worker_files()
 
-    install_interactive_worker_content = f"""@echo off
-setlocal
-
-echo === Instalando tarefa agendada do interactive worker ===
-cmd /c "{interactive_files['install_interactive_worker_bat']}"
-exit /b %errorlevel%
-"""
-
-    remove_interactive_worker_content = f"""@echo off
-setlocal
-
-echo === Removendo tarefa agendada do interactive worker ===
-cmd /c "{interactive_files['remove_interactive_worker_bat']}"
-exit /b %errorlevel%
-"""
-
-    run_interactive_worker_content = f"""@echo off
-setlocal
-
-echo === Executando interactive worker manualmente ===
-cmd /c "{interactive_files['run_interactive_worker_bat']}"
-exit /b %errorlevel%
-"""
-
-    diagnostic_interactive_worker_content = f"""@echo off
-setlocal
-
-echo === DIAGNOSTICO DO INTERACTIVE WORKER ===
-cmd /c "{interactive_files['diagnostic_interactive_worker_bat']}"
-echo.
-echo === ARQUIVOS GERADOS ===
-echo script: {interactive_files.get('interactive_worker_script', '-')}
-echo vbs: {interactive_files.get('interactive_worker_vbs', '-')}
-echo run_bat: {interactive_files.get('run_interactive_worker_bat', '-')}
-echo install_bat: {interactive_files.get('install_interactive_worker_bat', '-')}
-echo remove_bat: {interactive_files.get('remove_interactive_worker_bat', '-')}
-"""
-
-    INSTALL_INTERACTIVE_WORKER_BAT.write_text(
-        install_interactive_worker_content,
-        encoding="utf-8",
-    )
-    REMOVE_INTERACTIVE_WORKER_BAT.write_text(
-        remove_interactive_worker_content,
-        encoding="utf-8",
-    )
-    RUN_INTERACTIVE_WORKER_BAT.write_text(
-        run_interactive_worker_content,
-        encoding="utf-8",
-    )
-    DIAGNOSTIC_INTERACTIVE_WORKER_BAT.write_text(
-        diagnostic_interactive_worker_content,
-        encoding="utf-8",
-    )
-
     return {
         "service_config_file": str(SERVICE_CONFIG_FILE),
         "install_service_bat": str(INSTALL_SERVICE_BAT),
@@ -286,8 +227,9 @@ echo remove_bat: {interactive_files.get('remove_interactive_worker_bat', '-')}
         "diagnostic_service_bat": str(DIAGNOSTIC_SERVICE_BAT),
         "interactive_worker_script": interactive_files.get("interactive_worker_script", ""),
         "interactive_worker_vbs": interactive_files.get("interactive_worker_vbs", ""),
-        "install_interactive_worker_bat": str(INSTALL_INTERACTIVE_WORKER_BAT),
-        "remove_interactive_worker_bat": str(REMOVE_INTERACTIVE_WORKER_BAT),
-        "run_interactive_worker_bat": str(RUN_INTERACTIVE_WORKER_BAT),
-        "diagnostic_interactive_worker_bat": str(DIAGNOSTIC_INTERACTIVE_WORKER_BAT),
+        "install_interactive_worker_bat": interactive_files.get("install_interactive_worker_bat", ""),
+        "remove_interactive_worker_bat": interactive_files.get("remove_interactive_worker_bat", ""),
+        "run_interactive_worker_bat": interactive_files.get("run_interactive_worker_bat", ""),
+        "diagnostic_interactive_worker_bat": interactive_files.get("diagnostic_interactive_worker_bat", ""),
+        "interactive_worker_task_name": interactive_files.get("interactive_worker_task_name", ""),
     }

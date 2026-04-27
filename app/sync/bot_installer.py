@@ -29,6 +29,8 @@ def install_or_update_bot(bot: BotRegistryItem) -> InstallResult:
     _ensure_git_available()
     _prepare_repository(bot_dir=bot_dir, source_url=source_url)
     _checkout_expected_revision(bot=bot, bot_dir=bot_dir)
+    _sync_submodules(bot_dir)
+
     installed_commit = _get_current_commit(bot_dir)
 
     venv_python = _ensure_venv(venv_dir)
@@ -75,7 +77,7 @@ def _prepare_repository(bot_dir: Path, source_url: str) -> None:
     if not bot_dir.exists():
         bot_dir.parent.mkdir(parents=True, exist_ok=True)
         _run_command(
-            ["git", "clone", source_url, str(bot_dir)],
+            ["git", "clone", "--recursive", source_url, str(bot_dir)],
             cwd=None,
             error_prefix=f"Falha ao clonar repositório {source_url}",
         )
@@ -117,17 +119,48 @@ def _checkout_expected_revision(bot: BotRegistryItem, bot_dir: Path) -> None:
             cwd=bot_dir,
             error_prefix=f"Falha ao fazer checkout da branch {branch}",
         )
+
         _run_command(
-            ["git", "pull", "origin", branch],
+            ["git", "fetch", "origin", branch],
             cwd=bot_dir,
-            error_prefix=f"Falha ao atualizar branch {branch}",
+            error_prefix=f"Falha ao buscar branch {branch}",
+        )
+
+        _run_command(
+            ["git", "reset", "--hard", f"origin/{branch}"],
+            cwd=bot_dir,
+            error_prefix=f"Falha ao resetar branch {branch}",
+        )
+
+        _run_command(
+            ["git", "clean", "-fd"],
+            cwd=bot_dir,
+            error_prefix=f"Falha ao limpar arquivos locais da branch {branch}",
         )
         return
 
     _run_command(
-        ["git", "pull"],
+        ["git", "pull", "--recurse-submodules", "--ff-only"],
         cwd=bot_dir,
         error_prefix="Falha ao atualizar repositório",
+    )
+
+
+def _sync_submodules(bot_dir: Path) -> None:
+    gitmodules = bot_dir / ".gitmodules"
+    if not gitmodules.exists():
+        return
+
+    _run_command(
+        ["git", "submodule", "sync", "--recursive"],
+        cwd=bot_dir,
+        error_prefix="Falha ao sincronizar submodules",
+    )
+
+    _run_command(
+        ["git", "submodule", "update", "--init", "--recursive", "--force"],
+        cwd=bot_dir,
+        error_prefix="Falha ao atualizar submodules",
     )
 
 

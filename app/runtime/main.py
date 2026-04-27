@@ -14,12 +14,8 @@ from app.core.http_client import HttpClient
 from app.core.json_store import load_model, save_model
 from app.core.logging_config import setup_logging
 from app.core.security import unprotect_text
-from app.runtime.foreground_executor import ForegroundExecutor
 from app.runtime.task_client import TaskApiClient
-from app.runtime.task_executor import (
-    can_accept_foreground_task,
-    get_execution_mode,
-)
+from app.runtime.task_executor import get_execution_mode
 from app.runtime.task_manager import TaskExecutionManager
 from app.sync.bot_sync import sync_bots
 
@@ -96,12 +92,8 @@ def _build_task_api(auth: AuthData, access_token: str, runner: RunnerData) -> tu
 
 def _should_skip_task_before_claim(
     *,
-    auth: AuthData,
-    access_token: str,
-    runner: RunnerData,
     manager: TaskExecutionManager,
     task_data: dict,
-    logger,
 ) -> tuple[bool, str]:
     execution_mode = get_execution_mode(task_data)
 
@@ -114,16 +106,6 @@ def _should_skip_task_before_claim(
     can_start_locally, local_reason = manager.can_start_task(task_data)
     if not can_start_locally:
         return True, local_reason
-
-    can_accept, foreground_reason = can_accept_foreground_task(
-        auth=auth,
-        access_token=access_token,
-        runner=runner,
-        task_data=task_data,
-        logger=logger,
-    )
-    if not can_accept and execution_mode == EXECUTION_MODE_FOREGROUND:
-        return True, foreground_reason
 
     return False, "Task background elegível para claim."
 
@@ -154,12 +136,6 @@ def main() -> None:
         logger=logger,
     )
 
-    foreground_executor = ForegroundExecutor(
-        task_api=task_api,
-        runner=runner,
-        logger=logger,
-    )
-
     try:
         recover_runner_startup_tasks(task_api, runner, logger)
     except Exception as exc:
@@ -171,7 +147,6 @@ def main() -> None:
             save_model(RUNNER_FILE, runner)
 
             manager.cleanup_finished()
-            foreground_executor.cleanup_stale_results()
             active_count = manager.active_count()
 
             try:
@@ -192,12 +167,8 @@ def main() -> None:
                 execution_mode = get_execution_mode(next_task)
 
                 should_skip, skip_reason = _should_skip_task_before_claim(
-                    auth=auth,
-                    access_token=access_token,
-                    runner=runner,
                     manager=manager,
                     task_data=next_task,
-                    logger=logger,
                 )
 
                 if should_skip:

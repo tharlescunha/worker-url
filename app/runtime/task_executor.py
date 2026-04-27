@@ -16,20 +16,13 @@ from app.core.constants import (
     BOTS_REGISTRY_FILE,
     EXECUTION_MODE_BACKGROUND,
     EXECUTION_MODE_FOREGROUND,
-    RUNTIME_EVENT_REASON_FOREGROUND_BUSY,
-    RUNTIME_EVENT_REASON_INTERACTIVE_AGENT_NOT_ACTIVE,
-    RUNTIME_EVENT_TYPE_FOREGROUND_TASK_SKIPPED,
     TMP_DIR,
 )
 from app.core.http_client import HttpClient
 from app.core.json_store import load_model, save_model
-from app.runtime.foreground_executor import (
-    ForegroundExecutionError,
-    ForegroundExecutionTimeoutError,
-    ForegroundExecutor,
-    InteractiveAgentUnavailableError,
-)
+
 from app.runtime.task_client import TaskApiClient
+from app.runtime.screenshot_reporter import ScreenshotReporter
 from app.sync.bot_installer import install_or_update_bot
 
 
@@ -66,63 +59,15 @@ def can_accept_foreground_task(
     task_data: dict,
     logger,
 ) -> tuple[bool, str]:
-    client = HttpClient(base_url=auth.base_url)
-    client.set_token(access_token)
-
-    api = TaskApiClient(
-        client=client,
-        runner_uuid=runner.uuid,
-        runner_token=runner.runner_token,
-    )
-
     execution_mode = get_execution_mode(task_data)
+
     if execution_mode != EXECUTION_MODE_FOREGROUND:
         return True, "Task não é foreground."
 
     if is_interactive_worker_process():
         return True, "Interactive worker pode aceitar task foreground diretamente."
 
-    foreground_executor = ForegroundExecutor(
-        task_api=api,
-        runner=runner,
-        logger=logger,
-    )
-
-    accepted, reason = foreground_executor.can_accept_foreground_task()
-    if accepted:
-        return True, reason
-
-    task_id = _safe_int(task_data.get("task_id"))
-    automation_id = _safe_int(task_data.get("automation_id"))
-    bot_id = task_data.get("bot_id")
-
-    runtime_reason = (
-        RUNTIME_EVENT_REASON_INTERACTIVE_AGENT_NOT_ACTIVE
-        if "agente" in reason.lower() or "sessão" in reason.lower()
-        else RUNTIME_EVENT_REASON_FOREGROUND_BUSY
-    )
-
-    logger.warning(
-        "Task foreground não será pega nesta máquina | task_id=%s automation_id=%s bot_id=%s motivo=%s",
-        task_id,
-        automation_id,
-        bot_id,
-        reason,
-    )
-
-    api.try_send_runtime_event(
-        event_type=RUNTIME_EVENT_TYPE_FOREGROUND_TASK_SKIPPED,
-        task_id=task_id,
-        automation_id=automation_id,
-        bot_id=bot_id,
-        execution_mode=EXECUTION_MODE_FOREGROUND,
-        reason=runtime_reason,
-        message=f"Task foreground não foi pega porque {reason}",
-        logger=logger,
-    )
-
-    return False, reason
-
+    return False, "Task foreground só pode ser executada pelo interactive worker."
 
 def execute_task(
     auth: AuthData,
@@ -146,6 +91,7 @@ def execute_task(
     process: subprocess.Popen | None = None
     task_file: Path | None = None
     telemetry_collector: ProcessTelemetryCollector | None = None
+    screenshot_reporter: ScreenshotReporter | None = None
     execution_started_at = datetime.now(UTC)
 
     try:
@@ -186,6 +132,14 @@ def execute_task(
             ),
         )
 
+        if is_interactive_worker_process():
+            screenshot_reporter = ScreenshotReporter(
+                api=api,
+                interval_seconds=15,
+                logger=logger,
+            )
+            screenshot_reporter.start()
+
         logger.info(
             "Task iniciada | task_id=%s execution_mode=%s worker_role=%s",
             task_id,
@@ -196,27 +150,17 @@ def execute_task(
         timeout_seconds = task_data.get("timeout_seconds") or bot.timeout_default or 300
 
         if execution_mode == EXECUTION_MODE_FOREGROUND:
-            if is_interactive_worker_process():
-                _execute_foreground_direct(
-                    api=api,
-                    runner=runner,
-                    logger=logger,
-                    task_data=task_data,
-                    python_exe=python_exe,
-                    entrypoint=entrypoint,
-                    bot=bot,
-                    task_file=task_file,
-                    timeout_seconds=timeout_seconds,
-                    execution_started_at=execution_started_at,
+            if not is_interactive_worker_process():
+                raise RuntimeError(
+                    "Task foreground não pode ser executada pelo service worker. "
+                    "Ela deve ser executada exclusivamente pelo interactive worker."
                 )
-                return
 
-            _execute_foreground_task(
+            _execute_foreground_direct(
                 api=api,
                 runner=runner,
                 logger=logger,
                 task_data=task_data,
-                prepared_task_data=prepared_task_data,
                 python_exe=python_exe,
                 entrypoint=entrypoint,
                 bot=bot,
@@ -468,8 +412,14 @@ def execute_task(
         logger.error("Task finalizada com erro | task_id=%s", task_id)
 
     finally:
-        if telemetry_collector is not None:
-            telemetry_collector.ensure_stopped()
+        if screenshot_reporter is not None:
+            try:
+                screenshot_reporter.stop(send_final=True)
+            except Exception:
+                logger.exception("Falha ao finalizar ScreenshotReporter | task_id=%s", task_id)
+
+    if telemetry_collector is not None:
+        telemetry_collector.ensure_stopped()
 
         if task_file and task_file.exists():
             try:
@@ -519,6 +469,10 @@ def _execute_foreground_direct(
     net_before = psutil.net_io_counters()
 
     try:
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NO_WINDOW
+
         process = subprocess.Popen(
             command,
             cwd=str(Path(bot.local_path)),
@@ -529,6 +483,7 @@ def _execute_foreground_direct(
             errors="replace",
             env=env,
             shell=False,
+            creationflags=creationflags,
         )
 
         telemetry_collector = ProcessTelemetryCollector(process.pid)
@@ -740,215 +695,6 @@ def _execute_foreground_direct(
             items_failed=1,
         )
         logger.error("Task foreground finalizada com erro | task_id=%s", task_id)
-
-
-def _execute_foreground_task(
-    *,
-    api: TaskApiClient,
-    runner: RunnerData,
-    logger,
-    task_data: dict,
-    prepared_task_data: dict,
-    python_exe: Path,
-    entrypoint: Path,
-    bot: BotRegistryItem,
-    task_file: Path,
-    timeout_seconds: int,
-    execution_started_at: datetime,
-) -> None:
-    task_id = int(task_data["task_id"])
-
-    foreground_executor = ForegroundExecutor(
-        task_api=api,
-        runner=runner,
-        logger=logger,
-    )
-
-    try:
-        result = foreground_executor.execute(
-            task_data=task_data,
-            prepared_task_data=prepared_task_data,
-            python_exe=python_exe,
-            entrypoint=entrypoint,
-            bot_local_path=Path(bot.local_path),
-            payload_file=task_file,
-            timeout_seconds=timeout_seconds,
-        )
-    except InteractiveAgentUnavailableError as exc:
-        message = f"Agente interativo indisponível para task foreground: {exc}"
-        logger.warning("Task foreground indisponível | task_id=%s motivo=%s", task_id, exc)
-
-        api.try_send_runtime_event(
-            event_type=RUNTIME_EVENT_TYPE_FOREGROUND_TASK_SKIPPED,
-            task_id=task_id,
-            automation_id=_safe_int(task_data.get("automation_id")),
-            bot_id=task_data.get("bot_id"),
-            execution_mode=EXECUTION_MODE_FOREGROUND,
-            reason=RUNTIME_EVENT_REASON_INTERACTIVE_AGENT_NOT_ACTIVE,
-            message=message,
-            logger=logger,
-        )
-
-        raise RuntimeError(message) from exc
-
-    except ForegroundExecutionTimeoutError as exc:
-        timeout_message = str(exc)
-
-        telemetry = _build_foreground_telemetry(
-            result_payload=None,
-            execution_started_at=execution_started_at,
-            execution_finished_at=datetime.now(UTC),
-            telemetry_status="timeout",
-            message=timeout_message,
-        )
-
-        try:
-            _send_telemetry(api, task_id, telemetry, logger)
-        except Exception:
-            logger.exception("Falha ao enviar telemetria de timeout foreground | task_id=%s", task_id)
-
-        try:
-            api.send_log(
-                task_id=task_id,
-                level=LOG_LEVEL_ERROR,
-                message=timeout_message,
-                error_type="timeout",
-            )
-        except Exception:
-            logger.exception("Falha ao registrar log de timeout foreground | task_id=%s", task_id)
-
-        try:
-            api.send_error(
-                task_id=task_id,
-                error_type="timeout",
-                message=timeout_message,
-                stacktrace="ForegroundExecutionTimeoutError",
-                code="FOREGROUND_TIMEOUT",
-                is_retryable=False,
-            )
-        except Exception:
-            logger.exception("Falha ao registrar erro de timeout foreground | task_id=%s", task_id)
-
-        api.finish_task(
-            task_id=task_id,
-            status=TASK_STATUS_TIMEOUT,
-            final_message=timeout_message,
-            items_processed=0,
-            items_failed=1,
-        )
-        logger.error("Task foreground finalizada por timeout | task_id=%s", task_id)
-        return
-
-    except ForegroundExecutionError as exc:
-        message = f"Erro na execução foreground: {exc}"
-        stacktrace = traceback.format_exc()
-
-        telemetry = _build_foreground_telemetry(
-            result_payload=None,
-            execution_started_at=execution_started_at,
-            execution_finished_at=datetime.now(UTC),
-            telemetry_status="execution_error",
-            message=message,
-        )
-
-        try:
-            _send_telemetry(api, task_id, telemetry, logger)
-        except Exception:
-            logger.exception("Falha ao enviar telemetria de erro foreground | task_id=%s", task_id)
-
-        try:
-            api.send_log(
-                task_id=task_id,
-                level=LOG_LEVEL_ERROR,
-                message=message,
-                error_type="foreground_execution_error",
-            )
-        except Exception:
-            logger.exception("Falha ao registrar log de erro foreground | task_id=%s", task_id)
-
-        try:
-            api.send_error(
-                task_id=task_id,
-                error_type="foreground_execution_error",
-                message=message,
-                stacktrace=stacktrace,
-                code="FOREGROUND_EXECUTION_ERROR",
-                is_retryable=False,
-            )
-        except Exception:
-            logger.exception("Falha ao registrar erro foreground | task_id=%s", task_id)
-
-        api.finish_task(
-            task_id=task_id,
-            status=TASK_STATUS_ERROR,
-            final_message=_compose_error_final_message(message, stacktrace),
-            items_processed=0,
-            items_failed=1,
-        )
-        logger.error("Task foreground finalizada com erro | task_id=%s", task_id)
-        return
-
-    telemetry = _build_foreground_telemetry(
-        result_payload=result.result_payload,
-        execution_started_at=execution_started_at,
-        execution_finished_at=datetime.now(UTC),
-        telemetry_status="finished" if result.success else result.status,
-        message=result.final_message,
-    )
-
-    _log_process_output_locally(logger, task_id, result.stdout_text, result.stderr_text)
-
-    try:
-        _send_output_logs(api, task_id, result.stdout_text, result.stderr_text)
-    except Exception:
-        logger.exception("Falha ao registrar stdout/stderr foreground | task_id=%s", task_id)
-
-    try:
-        _send_telemetry(api, task_id, telemetry, logger)
-    except Exception:
-        logger.exception("Falha ao enviar telemetria foreground | task_id=%s", task_id)
-
-    if result.success:
-        api.finish_task(
-            task_id=task_id,
-            status=TASK_STATUS_FINISHED,
-            final_message=result.final_message,
-            items_processed=0,
-            items_failed=0,
-        )
-        logger.info("Task foreground finalizada com sucesso | task_id=%s", task_id)
-        return
-
-    error_message = result.final_message or "Bot foreground finalizou com erro."
-    trace_text = _build_stacktrace(result.stderr_text, result.stdout_text)
-
-    try:
-        api.send_error(
-            task_id=task_id,
-            error_type="foreground_bot_exit_code",
-            message=error_message,
-            stacktrace=trace_text,
-            code=str(result.exit_code) if result.exit_code is not None else "FOREGROUND_ERROR",
-            is_retryable=False,
-        )
-    except Exception as exc:
-        logger.exception("Falha ao registrar erro foreground | task_id=%s", task_id)
-        final_message = _compose_error_final_message(
-            error_message,
-            trace_text,
-            f"Falha ao registrar task_error: {exc}",
-        )
-    else:
-        final_message = _compose_error_final_message(error_message, trace_text)
-
-    api.finish_task(
-        task_id=task_id,
-        status=TASK_STATUS_ERROR if result.status != TASK_STATUS_TIMEOUT else TASK_STATUS_TIMEOUT,
-        final_message=final_message,
-        items_processed=0,
-        items_failed=1,
-    )
-    logger.error("Task foreground finalizada com erro | task_id=%s", task_id)
 
 
 class ProcessTelemetryCollector:

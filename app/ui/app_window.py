@@ -41,6 +41,7 @@ from app.service.nssm_manager import (
     stop_service,
 )
 from app.service.service_files import generate_service_files
+from app.runtime.interactive_worker_scheduler import install_interactive_worker_task
 
 
 class UrlValidationThread(QThread):
@@ -1203,20 +1204,51 @@ class InstallerWindow(QMainWindow):
     def _install_service_from_dashboard(self) -> None:
         try:
             files = generate_service_files()
-            success, output = install_service()
-            message = (
-                f"Arquivos do serviço gerados em {files['install_service_bat']}.\n"
-                f"Interactive worker: {files.get('install_interactive_worker_bat', '-')}\n\n"
-                + (output or "Nenhum detalhe retornado.")
-            )
-            self._refresh_dashboard(operation_message=message)
-            if success:
-                QMessageBox.information(self, "Serviço instalado", "Serviço instalado ou atualizado com sucesso.")
+
+            service_success, service_output = install_service()
+            interactive_success, interactive_output = install_interactive_worker_task()
+
+            message_parts = [
+                f"Arquivos do serviço gerados em {files['install_service_bat']}.",
+                f"Interactive worker: {files.get('install_interactive_worker_bat', '-')}",
+            ]
+
+            if service_success:
+                message_parts.append("Serviço instalado/atualizado com sucesso.")
             else:
-                QMessageBox.warning(self, "Falha na instalação", message)
+                message_parts.append("Falha ao instalar/atualizar serviço.")
+
+            if service_output:
+                message_parts.append(service_output)
+
+            if interactive_success:
+                message_parts.append("Interactive worker instalado e iniciado com sucesso.")
+            else:
+                message_parts.append("Falha ao instalar/iniciar interactive worker.")
+
+            if interactive_output:
+                message_parts.append(interactive_output)
+
+            message = "\n\n".join(message_parts)
+
+            self._refresh_dashboard(operation_message=message)
+
+            if service_success and interactive_success:
+                QMessageBox.information(
+                    self,
+                    "Instalação concluída",
+                    "Serviço e interactive worker foram instalados/atualizados com sucesso.",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Instalação com alerta",
+                    message,
+                )
+
         except Exception as exc:
-            self._refresh_dashboard(operation_message=f"Erro ao instalar serviço: {exc}")
-            QMessageBox.critical(self, "Erro ao instalar serviço", str(exc))
+            self._refresh_dashboard(operation_message=f"Erro ao instalar componentes: {exc}")
+            QMessageBox.critical(self, "Erro ao instalar componentes", str(exc))
 
     def _execute_service_action(self, action: str) -> None:
         actions = {

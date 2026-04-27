@@ -15,6 +15,7 @@ ERROR_TASK_PATH = "/api/v1/worker/tasks/{task_id}/errors"
 TELEMETRY_TASK_PATH = "/api/v1/worker/tasks/{task_id}/telemetry"
 HEARTBEAT_PATH = "/api/v1/worker/heartbeat/"
 RESOLVE_CREDENTIAL_PATH = "/api/v1/worker/credentials/{credential_id}/resolve"
+SCREENSHOT_PATH = "/api/v1/worker/screenshot/"
 
 LIST_ACTIVE_TASKS_PATH = "/api/v1/worker/tasks/active"
 RELEASE_LOCK_PATH = "/api/v1/worker/tasks/{task_id}/release-lock"
@@ -204,6 +205,21 @@ class TaskApiClient:
 
         return self.client.post(
             TELEMETRY_TASK_PATH.format(task_id=task_id),
+            payload,
+        )
+
+    def send_screenshot(
+        self,
+        *,
+        image_base64: str,
+        content_type: str = "image/png",
+    ) -> dict:
+        payload = self._auth_payload()
+        payload["image_base64"] = image_base64
+        payload["content_type"] = content_type
+
+        return self.client.post(
+            SCREENSHOT_PATH,
             payload,
         )
 

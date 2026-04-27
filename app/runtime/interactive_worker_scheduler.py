@@ -30,31 +30,28 @@ def generate_interactive_worker_files() -> dict[str, str]:
     INTERACTIVE_WORKER_SCRIPT.parent.mkdir(parents=True, exist_ok=True)
     INSTALL_INTERACTIVE_WORKER_BAT.parent.mkdir(parents=True, exist_ok=True)
 
+    # Mantido por compatibilidade/diagnóstico, mas o fluxo real não depende mais dele.
     script_content = """from app.runtime.interactive_worker import main
 
 if __name__ == "__main__":
     main()
 """
 
+    # VBS agora executa o módulo direto, oculto, sem abrir terminal.
     vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
 WshShell.CurrentDirectory = "{str(runtime_dir)}"
-WshShell.Run chr(34) & "{str(python_executable)}" & chr(34) & " " & chr(34) & "{str(INTERACTIVE_WORKER_SCRIPT)}" & chr(34), 0, False
+WshShell.Run chr(34) & "{str(python_executable)}" & chr(34) & " -m app.runtime.interactive_worker", 0, False
 '''
 
+    # Execução manual para teste/diagnóstico: usa o módulo direto.
     run_bat_content = f'''@echo off
 setlocal
 
 set PYTHON_EXE={str(python_executable)}
-set WORKER_SCRIPT={str(INTERACTIVE_WORKER_SCRIPT)}
 set WORK_DIR={str(runtime_dir)}
 
 if not exist "%PYTHON_EXE%" (
     echo Python nao encontrado em %PYTHON_EXE%
-    exit /b 1
-)
-
-if not exist "%WORKER_SCRIPT%" (
-    echo Script do interactive worker nao encontrado em %WORKER_SCRIPT%
     exit /b 1
 )
 
@@ -64,11 +61,13 @@ if not exist "%WORK_DIR%" (
 )
 
 cd /d "%WORK_DIR%"
-"%PYTHON_EXE%" "%WORKER_SCRIPT%"
+"%PYTHON_EXE%" -m app.runtime.interactive_worker
+exit /b %errorlevel%
 '''
 
     current_user = getpass.getuser()
 
+    # Instala a task agendada interativa e já sobe o worker oculto na sessão atual.
     install_bat_content = f'''@echo off
 setlocal
 
@@ -97,6 +96,10 @@ schtasks /Create ^
 
 if errorlevel 1 exit /b 1
 
+rem Sobe imediatamente na sessao atual, de forma oculta.
+wscript.exe "%VBS_PATH%"
+if errorlevel 1 exit /b 1
+
 exit /b 0
 '''
 
@@ -117,7 +120,10 @@ echo.
 echo === PYTHON ===
 "{str(python_executable)}" --version
 echo.
-echo === WORKER SCRIPT ===
+echo === WORKER MODULE ===
+echo app.runtime.interactive_worker
+echo.
+echo === WORKER SCRIPT (LEGADO/COMPAT) ===
 echo {str(INTERACTIVE_WORKER_SCRIPT)}
 echo.
 echo === VBS ===

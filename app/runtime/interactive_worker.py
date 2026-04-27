@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import time
+from ctypes import wintypes
 
 from app.core.config_models import AuthData, RunnerData
 from app.core.constants import AUTH_FILE, EXECUTION_MODE_FOREGROUND, RUNNER_FILE
@@ -12,6 +14,39 @@ from app.core.security import unprotect_text
 from app.runtime.foreground_session import get_interactive_session_info
 from app.runtime.task_client import TaskApiClient
 from app.runtime.task_executor import execute_task, get_execution_mode
+
+
+ERROR_ALREADY_EXISTS = 183
+INTERACTIVE_WORKER_MUTEX_NAME = "Global\\OrkaFlowInteractiveWorker"
+
+
+def _acquire_single_instance_mutex(logger):
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+
+        mutex_handle = kernel32.CreateMutexW(
+            None,
+            True,
+            INTERACTIVE_WORKER_MUTEX_NAME,
+        )
+
+        last_error = kernel32.GetLastError()
+
+        if not mutex_handle:
+            logger.error("Não foi possível criar mutex do interactive worker.")
+            return None, False
+
+        if last_error == ERROR_ALREADY_EXISTS:
+            logger.warning("Interactive Worker já está em execução. Encerrando nova instância.")
+            return mutex_handle, False
+
+        return mutex_handle, True
+
+    except Exception as exc:
+        logger.warning("Falha ao validar instância única do interactive worker: %s", exc)
+        return None, True
 
 
 def _build_task_api(auth: AuthData, access_token: str, runner: RunnerData) -> tuple[HttpClient, TaskApiClient]:
@@ -105,6 +140,11 @@ def main() -> None:
     os.environ["ORKAFLOW_WORKER_ROLE"] = "interactive"
 
     logger = setup_logging()
+
+    mutex_handle, can_run = _acquire_single_instance_mutex(logger)
+    if not can_run:
+        print("Interactive Worker já está em execução.")
+        return
 
     print("=== INICIANDO INTERACTIVE WORKER ===")
 
