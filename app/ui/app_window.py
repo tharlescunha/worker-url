@@ -464,11 +464,25 @@ class InstallerWindow(QMainWindow):
         result = run_prerequisite_checks()
         text = ""
 
+        all_ok = True
+
         for k, (ok, msg) in result.items():
             status = "OK" if ok else "ERRO"
             text += f"{k.upper()}: {status} - {msg}\n"
 
+            if not ok:
+                all_ok = False
+
         self.prereq_output.setText(text)
+
+        if all_ok:
+            self._go_to_step(2)
+        else:
+            QMessageBox.warning(
+                self,
+                "Pré-requisitos pendentes",
+                "Existem pré-requisitos com erro. Corrija antes de continuar.",
+            )
 
     def _build_url_page(self) -> QWidget:
         page, layout = self._build_page_wrapper(
