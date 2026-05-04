@@ -117,7 +117,7 @@ def run_registration_flow(
         id=response["runner_id"],
         uuid=response["uuid"],
         name=response["name"],
-        label=response["label"],
+        label=response.get("label") or installer_input.runner_label,
         host_name=machine.get("host_name"),
         ip=machine.get("ip"),
         os_name=machine.get("os_name"),
