@@ -53,7 +53,13 @@ def build_task_api(
 
 
 def fetch_next_task(task_api: TaskApiClient) -> dict:
-    return task_api.next_task(None)
+    for execution_mode in ("foreground", "background"):
+        response = task_api.next_task(execution_mode)
+
+        if response.get("found"):
+            return response
+
+    return {"found": False}
 
 
 def main() -> None:

@@ -13,38 +13,30 @@ from app.core.constants import (
 )
 
 
-def create_worker_structure() -> dict[str, str]:
-    """
-    Cria toda a estrutura necessária do worker local.
+def create_desktop_shortcut() -> str:
+    desktop = Path(os.environ["USERPROFILE"]) / "Desktop"
+    shortcut = desktop / "OrkaFlow Worker.lnk"
 
-    Isso evita erro de:
-    - pasta não encontrada
-    - falha ao salvar JSON
-    - erro ao criar payload temporário
-    """
+    ps_script = f"""
+$WshShell = New-Object -ComObject WScript.Shell
+$Shortcut = $WshShell.CreateShortcut('{shortcut}')
+$Shortcut.TargetPath = '{WORKER_BAT_FILE}'
+$Shortcut.WorkingDirectory = '{WORKER_BAT_FILE.parent}'
+$Shortcut.IconLocation = "$env:SystemRoot\\System32\\cmd.exe"
+$Shortcut.Save()
+"""
 
-    paths = [
-        BASE_DIR,
-        APP_DIR,
-        BOTS_DIR,
-        CONFIG_DIR,
-        LOGS_DIR,
-        RUNTIME_DIR,
-        TMP_DIR,
-        TOOLS_DIR,
-        VENVS_DIR,
-    ]
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
 
-    created: dict[str, str] = {}
+    if result.returncode != 0:
+        raise RuntimeError(f"Falha ao criar atalho: {result.stderr or result.stdout}")
 
-    for path in paths:
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-            created[str(path)] = "ok"
-        except Exception as exc:
-            created[str(path)] = f"erro: {exc}"
-
-    return created
+    return str(shortcut)
 
 
 def ensure_tmp_dir() -> Path:
