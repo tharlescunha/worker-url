@@ -1,45 +1,79 @@
-# app\core\paths.py
-
-"""
-Gerenciamento da estrutura de pastas.
-As pastas só são criadas depois do cadastro concluído.
-"""
-
 from pathlib import Path
 
 from app.core.constants import (
-    APP_DIR,
     BASE_DIR,
+    APP_DIR,
     BOTS_DIR,
     CONFIG_DIR,
     LOGS_DIR,
     RUNTIME_DIR,
-    SERVICES_DIR,
     TMP_DIR,
     TOOLS_DIR,
     VENVS_DIR,
 )
 
-REQUIRED_DIRS = [
-    BASE_DIR,
-    APP_DIR,
-    BOTS_DIR,
-    CONFIG_DIR,
-    LOGS_DIR,
-    RUNTIME_DIR,
-    SERVICES_DIR,
-    TMP_DIR,
-    TOOLS_DIR,
-    VENVS_DIR,
-]
 
+def create_worker_structure() -> dict[str, str]:
+    """
+    Cria toda a estrutura necessária do worker local.
 
-def create_worker_structure() -> list[Path]:
-    created: list[Path] = []
+    Isso evita erro de:
+    - pasta não encontrada
+    - falha ao salvar JSON
+    - erro ao criar payload temporário
+    """
 
-    for path in REQUIRED_DIRS:
-        if not path.exists():
+    paths = [
+        BASE_DIR,
+        APP_DIR,
+        BOTS_DIR,
+        CONFIG_DIR,
+        LOGS_DIR,
+        RUNTIME_DIR,
+        TMP_DIR,
+        TOOLS_DIR,
+        VENVS_DIR,
+    ]
+
+    created: dict[str, str] = {}
+
+    for path in paths:
+        try:
             path.mkdir(parents=True, exist_ok=True)
-            created.append(path)
+            created[str(path)] = "ok"
+        except Exception as exc:
+            created[str(path)] = f"erro: {exc}"
 
     return created
+
+
+def ensure_tmp_dir() -> Path:
+    """
+    Garante que a pasta de temporários existe.
+    """
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    return TMP_DIR
+
+
+def ensure_logs_dir() -> Path:
+    """
+    Garante que a pasta de logs existe.
+    """
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    return LOGS_DIR
+
+
+def ensure_bots_dir() -> Path:
+    """
+    Garante que a pasta de bots existe.
+    """
+    BOTS_DIR.mkdir(parents=True, exist_ok=True)
+    return BOTS_DIR
+
+
+def ensure_venvs_dir() -> Path:
+    """
+    Garante que a pasta de venvs existe.
+    """
+    VENVS_DIR.mkdir(parents=True, exist_ok=True)
+    return VENVS_DIR

@@ -8,6 +8,7 @@ import time
 import traceback
 from datetime import UTC, datetime
 from pathlib import Path
+import queue
 
 import psutil
 
@@ -20,9 +21,8 @@ from app.core.constants import (
 )
 from app.core.http_client import HttpClient
 from app.core.json_store import load_model, save_model
-
-from app.runtime.task_client import TaskApiClient
 from app.runtime.screenshot_reporter import ScreenshotReporter
+from app.runtime.task_client import TaskApiClient
 from app.sync.bot_installer import install_or_update_bot
 
 
@@ -48,27 +48,6 @@ def get_execution_mode(task_data: dict) -> str:
     return execution_mode
 
 
-def is_interactive_worker_process() -> bool:
-    return str(os.environ.get("ORKAFLOW_WORKER_ROLE") or "").strip().lower() == "interactive"
-
-
-def can_accept_foreground_task(
-    auth: AuthData,
-    access_token: str,
-    runner: RunnerData,
-    task_data: dict,
-    logger,
-) -> tuple[bool, str]:
-    execution_mode = get_execution_mode(task_data)
-
-    if execution_mode != EXECUTION_MODE_FOREGROUND:
-        return True, "Task não é foreground."
-
-    if is_interactive_worker_process():
-        return True, "Interactive worker pode aceitar task foreground diretamente."
-
-    return False, "Task foreground só pode ser executada pelo interactive worker."
-
 def execute_task(
     auth: AuthData,
     access_token: str,
@@ -85,13 +64,14 @@ def execute_task(
         runner_token=runner.runner_token,
     )
 
+    task_id = int(task_data["task_id"])
     execution_mode = get_execution_mode(task_data)
 
-    task_id = int(task_data["task_id"])
     process: subprocess.Popen | None = None
     task_file: Path | None = None
     telemetry_collector: ProcessTelemetryCollector | None = None
     screenshot_reporter: ScreenshotReporter | None = None
+
     execution_started_at = datetime.now(UTC)
 
     try:
@@ -114,61 +94,28 @@ def execute_task(
         )
 
         task_file = _write_task_payload_file(
-            prepared_task_data,
+            task_data=prepared_task_data,
             execution_mode=execution_mode,
         )
 
         api.update_status(
             task_id=task_id,
             status=TASK_STATUS_RUNNING,
-            final_message=(
-                "Task iniciada pelo worker."
-                if execution_mode == EXECUTION_MODE_BACKGROUND
-                else (
-                    "Task foreground iniciada pelo interactive worker."
-                    if is_interactive_worker_process()
-                    else "Task foreground iniciada pelo agente interativo."
-                )
-            ),
+            final_message="Task iniciada pelo worker.",
         )
 
-        if is_interactive_worker_process():
-            screenshot_reporter = ScreenshotReporter(
-                api=api,
-                interval_seconds=15,
-                logger=logger,
-            )
-            screenshot_reporter.start()
-
-        logger.info(
-            "Task iniciada | task_id=%s execution_mode=%s worker_role=%s",
-            task_id,
-            execution_mode,
-            "interactive" if is_interactive_worker_process() else "service",
+        screenshot_reporter = ScreenshotReporter(
+            api=api,
+            interval_seconds=10,
+            logger=logger,
         )
+        screenshot_reporter.start()
 
-        timeout_seconds = task_data.get("timeout_seconds") or bot.timeout_default or 300
-
-        if execution_mode == EXECUTION_MODE_FOREGROUND:
-            if not is_interactive_worker_process():
-                raise RuntimeError(
-                    "Task foreground não pode ser executada pelo service worker. "
-                    "Ela deve ser executada exclusivamente pelo interactive worker."
-                )
-
-            _execute_foreground_direct(
-                api=api,
-                runner=runner,
-                logger=logger,
-                task_data=task_data,
-                python_exe=python_exe,
-                entrypoint=entrypoint,
-                bot=bot,
-                task_file=task_file,
-                timeout_seconds=timeout_seconds,
-                execution_started_at=execution_started_at,
-            )
-            return
+        timeout_seconds = int(
+            task_data.get("timeout_seconds")
+            or bot.timeout_default
+            or 300
+        )
 
         env = os.environ.copy()
         env["ORKAFLOW_TASK_FILE"] = str(task_file)
@@ -176,7 +123,8 @@ def execute_task(
         env["ORKAFLOW_AUTOMATION_ID"] = str(task_data.get("automation_id") or "")
         env["ORKAFLOW_RUNNER_ID"] = str(runner.id)
         env["ORKAFLOW_RUNNER_UUID"] = runner.uuid
-        env["ORKAFLOW_EXECUTION_MODE"] = EXECUTION_MODE_BACKGROUND
+        env["ORKAFLOW_EXECUTION_MODE"] = execution_mode
+        env["ORKAFLOW_WORKER_ROLE"] = "local"
 
         command = [
             str(python_exe),
@@ -184,7 +132,17 @@ def execute_task(
             str(task_file),
         ]
 
+        logger.info(
+            "Executando task | task_id=%s execution_mode=%s command=%s",
+            task_id,
+            execution_mode,
+            command,
+        )
+
+        print(f"Executando task {task_id} | modo={execution_mode}")
+
         net_before = psutil.net_io_counters()
+
         process = subprocess.Popen(
             command,
             cwd=str(Path(bot.local_path)),
@@ -194,12 +152,23 @@ def execute_task(
             encoding="utf-8",
             errors="replace",
             env=env,
+            shell=False,
+            bufsize=1,
         )
 
         telemetry_collector = ProcessTelemetryCollector(process.pid)
         telemetry_collector.start()
 
-        stdout_text, stderr_text = process.communicate(timeout=timeout_seconds)
+        if process.stdout is None or process.stderr is None:
+            raise RuntimeError("stdout/stderr do processo não foram inicializados.")
+
+        stdout_text, stderr_text = _consume_process_output_live(
+            process=process,
+            timeout_seconds=timeout_seconds,
+            logger=logger,
+            task_id=task_id,
+            api=api,
+        )
 
         telemetry = telemetry_collector.stop(
             execution_started_at=execution_started_at,
@@ -208,16 +177,13 @@ def execute_task(
             net_before=net_before,
             net_after=psutil.net_io_counters(),
             telemetry_status="finished" if process.returncode == 0 else "error",
-            message="Task finalizada com sucesso." if process.returncode == 0 else f"Bot finalizou com código de saída {process.returncode}.",
-            execution_mode=EXECUTION_MODE_BACKGROUND,
+            message=(
+                "Task finalizada com sucesso."
+                if process.returncode == 0
+                else f"Bot finalizou com código de saída {process.returncode}."
+            ),
+            execution_mode=execution_mode,
         )
-
-        _log_process_output_locally(logger, task_id, stdout_text, stderr_text)
-
-        try:
-            _send_output_logs(api, task_id, stdout_text, stderr_text)
-        except Exception:
-            logger.exception("Falha ao registrar stdout/stderr da task | task_id=%s", task_id)
 
         try:
             _send_telemetry(api, task_id, telemetry, logger)
@@ -232,12 +198,13 @@ def execute_task(
                 items_processed=0,
                 items_failed=0,
             )
+
             logger.info("Task finalizada com sucesso | task_id=%s", task_id)
+            print(f"Task finalizada com sucesso | task_id={task_id}")
             return
 
         error_message = f"Bot finalizou com código de saída {process.returncode}."
         trace_text = _build_stacktrace(stderr_text, stdout_text)
-        final_message = error_message
 
         try:
             api.send_error(
@@ -265,7 +232,9 @@ def execute_task(
             items_processed=0,
             items_failed=1,
         )
+
         logger.error("Task finalizada com erro | task_id=%s returncode=%s", task_id, process.returncode)
+        print(f"Task finalizada com erro | task_id={task_id} | exit_code={process.returncode}")
 
     except subprocess.TimeoutExpired:
         if process and process.pid:
@@ -284,7 +253,7 @@ def execute_task(
                     net_after=psutil.net_io_counters(),
                     telemetry_status="timeout",
                     message=timeout_message,
-                    execution_mode=EXECUTION_MODE_BACKGROUND,
+                    execution_mode=execution_mode,
                 )
             except Exception:
                 logger.exception("Falha ao coletar telemetria de timeout | task_id=%s", task_id)
@@ -305,8 +274,6 @@ def execute_task(
         except Exception:
             logger.exception("Falha ao registrar log de timeout | task_id=%s", task_id)
 
-        final_message = timeout_message
-
         try:
             api.send_error(
                 task_id=task_id,
@@ -316,6 +283,7 @@ def execute_task(
                 code="TIMEOUT",
                 is_retryable=False,
             )
+            final_message = _compose_error_final_message(timeout_message, "TimeoutExpired")
         except Exception as exc:
             logger.exception("Falha ao registrar erro de timeout | task_id=%s", task_id)
             final_message = _compose_error_final_message(
@@ -323,8 +291,6 @@ def execute_task(
                 "TimeoutExpired",
                 f"Falha ao registrar task_error: {exc}",
             )
-        else:
-            final_message = _compose_error_final_message(timeout_message, "TimeoutExpired")
 
         try:
             api.finish_task(
@@ -338,6 +304,7 @@ def execute_task(
             logger.exception("Falha ao finalizar task com timeout | task_id=%s", task_id)
 
         logger.error("Task finalizada por timeout | task_id=%s", task_id)
+        print(f"Task finalizada por timeout | task_id={task_id}")
 
     except Exception as exc:
         message = f"Erro ao executar task: {exc}"
@@ -354,7 +321,7 @@ def execute_task(
                     net_after=psutil.net_io_counters(),
                     telemetry_status="execution_error",
                     message=message,
-                    execution_mode=EXECUTION_MODE_BACKGROUND,
+                    execution_mode=execution_mode,
                 )
             except Exception:
                 logger.exception("Falha ao coletar telemetria de erro | task_id=%s", task_id)
@@ -377,8 +344,6 @@ def execute_task(
         except Exception:
             logger.exception("Falha ao registrar log de erro | task_id=%s", task_id)
 
-        final_message = message
-
         try:
             api.send_error(
                 task_id=task_id,
@@ -388,6 +353,7 @@ def execute_task(
                 code="EXECUTION_ERROR",
                 is_retryable=False,
             )
+            final_message = _compose_error_final_message(message, stacktrace)
         except Exception as api_exc:
             logger.exception("Falha ao registrar erro da task | task_id=%s", task_id)
             final_message = _compose_error_final_message(
@@ -395,8 +361,6 @@ def execute_task(
                 stacktrace,
                 f"Falha ao registrar task_error: {api_exc}",
             )
-        else:
-            final_message = _compose_error_final_message(message, stacktrace)
 
         try:
             api.finish_task(
@@ -409,7 +373,7 @@ def execute_task(
         except Exception:
             logger.exception("Falha ao finalizar task com erro | task_id=%s", task_id)
 
-        logger.error("Task finalizada com erro | task_id=%s", task_id)
+        print(f"Task finalizada com erro | task_id={task_id}")
 
     finally:
         if screenshot_reporter is not None:
@@ -418,283 +382,14 @@ def execute_task(
             except Exception:
                 logger.exception("Falha ao finalizar ScreenshotReporter | task_id=%s", task_id)
 
-    if telemetry_collector is not None:
-        telemetry_collector.ensure_stopped()
+        if telemetry_collector is not None:
+            telemetry_collector.ensure_stopped()
 
         if task_file and task_file.exists():
             try:
                 task_file.unlink()
             except Exception:
                 logger.warning("Não foi possível remover o arquivo temporário da task: %s", task_file)
-
-
-def _execute_foreground_direct(
-    *,
-    api: TaskApiClient,
-    runner: RunnerData,
-    logger,
-    task_data: dict,
-    python_exe: Path,
-    entrypoint: Path,
-    bot: BotRegistryItem,
-    task_file: Path,
-    timeout_seconds: int,
-    execution_started_at: datetime,
-) -> None:
-    task_id = int(task_data["task_id"])
-    process: subprocess.Popen | None = None
-    telemetry_collector: ProcessTelemetryCollector | None = None
-
-    env = os.environ.copy()
-    env["ORKAFLOW_TASK_FILE"] = str(task_file)
-    env["ORKAFLOW_TASK_ID"] = str(task_id)
-    env["ORKAFLOW_AUTOMATION_ID"] = str(task_data.get("automation_id") or "")
-    env["ORKAFLOW_RUNNER_ID"] = str(runner.id)
-    env["ORKAFLOW_RUNNER_UUID"] = runner.uuid
-    env["ORKAFLOW_EXECUTION_MODE"] = EXECUTION_MODE_FOREGROUND
-    env["ORKAFLOW_WORKER_ROLE"] = "interactive"
-
-    command = [
-        str(python_exe),
-        str(entrypoint),
-        str(task_file),
-    ]
-
-    logger.info(
-        "Executando foreground diretamente no interactive worker | task_id=%s command=%s",
-        task_id,
-        command,
-    )
-
-    net_before = psutil.net_io_counters()
-
-    try:
-        creationflags = 0
-        if os.name == "nt":
-            creationflags = subprocess.CREATE_NO_WINDOW
-
-        process = subprocess.Popen(
-            command,
-            cwd=str(Path(bot.local_path)),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-            shell=False,
-            creationflags=creationflags,
-        )
-
-        telemetry_collector = ProcessTelemetryCollector(process.pid)
-        telemetry_collector.start()
-
-        stdout_text, stderr_text = process.communicate(timeout=timeout_seconds)
-
-        telemetry = telemetry_collector.stop(
-            execution_started_at=execution_started_at,
-            execution_finished_at=datetime.now(UTC),
-            exit_code=process.returncode,
-            net_before=net_before,
-            net_after=psutil.net_io_counters(),
-            telemetry_status="finished" if process.returncode == 0 else "error",
-            message=(
-                "Task foreground finalizada com sucesso."
-                if process.returncode == 0
-                else f"Bot foreground finalizou com código de saída {process.returncode}."
-            ),
-            execution_mode=EXECUTION_MODE_FOREGROUND,
-        )
-
-        _log_process_output_locally(logger, task_id, stdout_text, stderr_text)
-
-        try:
-            _send_output_logs(api, task_id, stdout_text, stderr_text)
-        except Exception:
-            logger.exception("Falha ao registrar stdout/stderr foreground direto | task_id=%s", task_id)
-
-        try:
-            _send_telemetry(api, task_id, telemetry, logger)
-        except Exception:
-            logger.exception("Falha ao enviar telemetria foreground direto | task_id=%s", task_id)
-
-        if process.returncode == 0:
-            api.finish_task(
-                task_id=task_id,
-                status=TASK_STATUS_FINISHED,
-                final_message="Task foreground finalizada com sucesso.",
-                items_processed=0,
-                items_failed=0,
-            )
-            logger.info("Task foreground finalizada com sucesso | task_id=%s", task_id)
-            return
-
-        error_message = f"Bot foreground finalizou com código de saída {process.returncode}."
-        trace_text = _build_stacktrace(stderr_text, stdout_text)
-
-        try:
-            api.send_error(
-                task_id=task_id,
-                error_type="foreground_bot_exit_code",
-                message=error_message,
-                stacktrace=trace_text,
-                code=str(process.returncode),
-                is_retryable=False,
-            )
-        except Exception as exc:
-            logger.exception("Falha ao registrar erro foreground direto | task_id=%s", task_id)
-            final_message = _compose_error_final_message(
-                error_message,
-                trace_text,
-                f"Falha ao registrar task_error: {exc}",
-            )
-        else:
-            final_message = _compose_error_final_message(error_message, trace_text)
-
-        api.finish_task(
-            task_id=task_id,
-            status=TASK_STATUS_ERROR,
-            final_message=final_message,
-            items_processed=0,
-            items_failed=1,
-        )
-        logger.error("Task foreground finalizada com erro | task_id=%s returncode=%s", task_id, process.returncode)
-
-    except subprocess.TimeoutExpired:
-        if process and process.pid:
-            _kill_process_tree(process.pid)
-
-        timeout_message = "Task foreground excedeu o timeout e foi encerrada pelo interactive worker."
-
-        telemetry = None
-        if telemetry_collector is not None:
-            try:
-                telemetry = telemetry_collector.stop(
-                    execution_started_at=execution_started_at,
-                    execution_finished_at=datetime.now(UTC),
-                    exit_code=None,
-                    net_before=None,
-                    net_after=psutil.net_io_counters(),
-                    telemetry_status="timeout",
-                    message=timeout_message,
-                    execution_mode=EXECUTION_MODE_FOREGROUND,
-                )
-            except Exception:
-                logger.exception("Falha ao coletar telemetria de timeout foreground direto | task_id=%s", task_id)
-
-        if telemetry is not None:
-            try:
-                _send_telemetry(api, task_id, telemetry, logger)
-            except Exception:
-                logger.exception("Falha ao enviar telemetria de timeout foreground direto | task_id=%s", task_id)
-
-        try:
-            api.send_log(
-                task_id=task_id,
-                level=LOG_LEVEL_ERROR,
-                message=timeout_message,
-                error_type="timeout",
-            )
-        except Exception:
-            logger.exception("Falha ao registrar log de timeout foreground direto | task_id=%s", task_id)
-
-        final_message = timeout_message
-
-        try:
-            api.send_error(
-                task_id=task_id,
-                error_type="timeout",
-                message=timeout_message,
-                stacktrace="TimeoutExpired",
-                code="FOREGROUND_TIMEOUT",
-                is_retryable=False,
-            )
-        except Exception as exc:
-            logger.exception("Falha ao registrar erro de timeout foreground direto | task_id=%s", task_id)
-            final_message = _compose_error_final_message(
-                timeout_message,
-                "TimeoutExpired",
-                f"Falha ao registrar task_error: {exc}",
-            )
-        else:
-            final_message = _compose_error_final_message(timeout_message, "TimeoutExpired")
-
-        api.finish_task(
-            task_id=task_id,
-            status=TASK_STATUS_TIMEOUT,
-            final_message=final_message,
-            items_processed=0,
-            items_failed=1,
-        )
-        logger.error("Task foreground finalizada por timeout | task_id=%s", task_id)
-
-    except Exception as exc:
-        message = f"Erro ao executar task foreground diretamente: {exc}"
-        stacktrace = traceback.format_exc()
-
-        telemetry = None
-        if telemetry_collector is not None:
-            try:
-                telemetry = telemetry_collector.stop(
-                    execution_started_at=execution_started_at,
-                    execution_finished_at=datetime.now(UTC),
-                    exit_code=process.returncode if process else None,
-                    net_before=None,
-                    net_after=psutil.net_io_counters(),
-                    telemetry_status="execution_error",
-                    message=message,
-                    execution_mode=EXECUTION_MODE_FOREGROUND,
-                )
-            except Exception:
-                logger.exception("Falha ao coletar telemetria de erro foreground direto | task_id=%s", task_id)
-
-        if telemetry is not None:
-            try:
-                _send_telemetry(api, task_id, telemetry, logger)
-            except Exception:
-                logger.exception("Falha ao enviar telemetria de erro foreground direto | task_id=%s", task_id)
-
-        logger.exception("Erro ao executar task foreground diretamente | task_id=%s", task_id)
-
-        try:
-            api.send_log(
-                task_id=task_id,
-                level=LOG_LEVEL_ERROR,
-                message=message,
-                error_type="execution_error",
-            )
-        except Exception:
-            logger.exception("Falha ao registrar log de erro foreground direto | task_id=%s", task_id)
-
-        final_message = message
-
-        try:
-            api.send_error(
-                task_id=task_id,
-                error_type="execution_error",
-                message=message,
-                stacktrace=stacktrace,
-                code="FOREGROUND_EXECUTION_ERROR",
-                is_retryable=False,
-            )
-        except Exception as api_exc:
-            logger.exception("Falha ao registrar erro foreground direto | task_id=%s", task_id)
-            final_message = _compose_error_final_message(
-                message,
-                stacktrace,
-                f"Falha ao registrar task_error: {api_exc}",
-            )
-        else:
-            final_message = _compose_error_final_message(message, stacktrace)
-
-        api.finish_task(
-            task_id=task_id,
-            status=TASK_STATUS_ERROR,
-            final_message=final_message,
-            items_processed=0,
-            items_failed=1,
-        )
-        logger.error("Task foreground finalizada com erro | task_id=%s", task_id)
 
 
 class ProcessTelemetryCollector:
@@ -729,9 +424,10 @@ class ProcessTelemetryCollector:
         net_after,
         telemetry_status: str,
         message: str | None,
-        execution_mode: str = EXECUTION_MODE_BACKGROUND,
+        execution_mode: str,
     ) -> dict:
         self._stop_event.set()
+
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
 
@@ -739,22 +435,19 @@ class ProcessTelemetryCollector:
 
         disk_read_mb = None
         disk_write_mb = None
+
         if self.disk_read_bytes_last is not None:
             disk_read_mb = round(self.disk_read_bytes_last / (1024 * 1024), 3)
+
         if self.disk_write_bytes_last is not None:
             disk_write_mb = round(self.disk_write_bytes_last / (1024 * 1024), 3)
 
         net_sent_mb = None
         net_recv_mb = None
+
         if net_before is not None and net_after is not None:
             net_sent_mb = round(max(0, net_after.bytes_sent - net_before.bytes_sent) / (1024 * 1024), 3)
             net_recv_mb = round(max(0, net_after.bytes_recv - net_before.bytes_recv) / (1024 * 1024), 3)
-
-        cpu_percent_avg = _avg_or_none(self.cpu_samples)
-        cpu_percent_peak = _max_or_none(self.cpu_samples)
-        memory_used_mb_avg = _avg_or_none(self.memory_machine_samples_mb)
-        memory_used_mb_peak = _max_or_none(self.memory_machine_samples_mb)
-        process_memory_mb_peak = _max_or_none(self.process_memory_samples_mb)
 
         payload = {
             "cpu_samples": self.cpu_samples,
@@ -772,11 +465,11 @@ class ProcessTelemetryCollector:
             "execution_started_at": execution_started_at.isoformat(),
             "execution_finished_at": execution_finished_at.isoformat(),
             "duration_seconds": duration_seconds,
-            "cpu_percent_avg": cpu_percent_avg,
-            "cpu_percent_peak": cpu_percent_peak,
-            "memory_used_mb_avg": memory_used_mb_avg,
-            "memory_used_mb_peak": memory_used_mb_peak,
-            "process_memory_mb_peak": process_memory_mb_peak,
+            "cpu_percent_avg": _avg_or_none(self.cpu_samples),
+            "cpu_percent_peak": _max_or_none(self.cpu_samples),
+            "memory_used_mb_avg": _avg_or_none(self.memory_machine_samples_mb),
+            "memory_used_mb_peak": _max_or_none(self.memory_machine_samples_mb),
+            "process_memory_mb_peak": _max_or_none(self.process_memory_samples_mb),
             "disk_read_mb": disk_read_mb,
             "disk_write_mb": disk_write_mb,
             "net_sent_mb": net_sent_mb,
@@ -789,6 +482,7 @@ class ProcessTelemetryCollector:
 
     def ensure_stopped(self) -> None:
         self._stop_event.set()
+
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1)
 
@@ -802,8 +496,7 @@ class ProcessTelemetryCollector:
                     break
 
                 try:
-                    cpu_percent = psutil.cpu_percent(interval=None)
-                    self.cpu_samples.append(round(cpu_percent, 3))
+                    self.cpu_samples.append(round(psutil.cpu_percent(interval=None), 3))
                 except Exception:
                     pass
 
@@ -827,48 +520,9 @@ class ProcessTelemetryCollector:
                     pass
 
                 time.sleep(self.interval_seconds)
+
         except Exception:
             return
-
-
-def _build_foreground_telemetry(
-    *,
-    result_payload: dict | None,
-    execution_started_at: datetime,
-    execution_finished_at: datetime,
-    telemetry_status: str,
-    message: str | None,
-) -> dict:
-    duration_seconds = round((execution_finished_at - execution_started_at).total_seconds(), 3)
-
-    payload = dict(result_payload or {})
-    payload["execution_mode"] = EXECUTION_MODE_FOREGROUND
-
-    return {
-        "captured_at": execution_finished_at.isoformat(),
-        "execution_started_at": (
-            payload.get("started_at")
-            or execution_started_at.isoformat()
-        ),
-        "execution_finished_at": (
-            payload.get("finished_at")
-            or execution_finished_at.isoformat()
-        ),
-        "duration_seconds": payload.get("duration_seconds", duration_seconds),
-        "cpu_percent_avg": None,
-        "cpu_percent_peak": None,
-        "memory_used_mb_avg": None,
-        "memory_used_mb_peak": None,
-        "process_memory_mb_peak": None,
-        "disk_read_mb": None,
-        "disk_write_mb": None,
-        "net_sent_mb": None,
-        "net_recv_mb": None,
-        "exit_code": payload.get("exit_code"),
-        "telemetry_status": telemetry_status,
-        "message": message,
-        "payload_json": json.dumps(payload, ensure_ascii=False),
-    }
 
 
 def _send_telemetry(api: TaskApiClient, task_id: int, telemetry: dict, logger) -> None:
@@ -892,23 +546,13 @@ def _send_telemetry(api: TaskApiClient, task_id: int, telemetry: dict, logger) -
         message=telemetry.get("message"),
         payload_json=telemetry.get("payload_json"),
     )
+
     logger.info("Telemetria enviada com sucesso | task_id=%s", task_id)
-
-
-def _avg_or_none(values: list[float]) -> float | None:
-    if not values:
-        return None
-    return round(sum(values) / len(values), 3)
-
-
-def _max_or_none(values: list[float]) -> float | None:
-    if not values:
-        return None
-    return round(max(values), 3)
 
 
 def _resolve_bot_for_task(task_data: dict) -> BotRegistryItem:
     registry = load_model(BOTS_REGISTRY_FILE, BotsRegistry)
+
     if not registry:
         raise RuntimeError("bots_registry.json não encontrado.")
 
@@ -917,12 +561,12 @@ def _resolve_bot_for_task(task_data: dict) -> BotRegistryItem:
 
     for bot in registry.bots:
         if task_bot_id is not None and str(bot.bot_id) == str(task_bot_id):
-            if task_bot_version_id is None or getattr(bot, "bot_version_id", None) == task_bot_version_id:
+            if task_bot_version_id is None or bot.bot_version_id == task_bot_version_id:
                 return bot
 
     if task_bot_version_id is not None:
         for bot in registry.bots:
-            if getattr(bot, "bot_version_id", None) == task_bot_version_id:
+            if bot.bot_version_id == task_bot_version_id:
                 return bot
 
     raise RuntimeError(
@@ -933,10 +577,12 @@ def _resolve_bot_for_task(task_data: dict) -> BotRegistryItem:
 
 def _ensure_bot_ready(bot: BotRegistryItem) -> BotRegistryItem:
     registry = load_model(BOTS_REGISTRY_FILE, BotsRegistry)
+
     if not registry:
         raise RuntimeError("bots_registry.json não encontrado.")
 
     target: BotRegistryItem | None = None
+
     for item in registry.bots:
         if item.bot_id == bot.bot_id:
             target = item
@@ -961,6 +607,7 @@ def _ensure_bot_ready(bot: BotRegistryItem) -> BotRegistryItem:
 
     if needs_prepare:
         result = install_or_update_bot(target)
+
         target.local_path = result.local_path
         target.venv_path = result.venv_path
         target.installed_version = target.expected_version
@@ -968,6 +615,7 @@ def _ensure_bot_ready(bot: BotRegistryItem) -> BotRegistryItem:
         target.requirements_hash = result.requirements_hash
         target.last_install_status = "ok"
         target.last_install_message = result.message
+
         save_model(BOTS_REGISTRY_FILE, registry)
 
     return target
@@ -982,6 +630,7 @@ def _prepare_task_data_for_execution(
     original_parameters = task_data.get("parameters") or []
 
     prepared_parameters: list[dict] = []
+
     for param in original_parameters:
         prepared_parameters.append(
             _resolve_parameter_for_execution(
@@ -993,6 +642,7 @@ def _prepare_task_data_for_execution(
 
     prepared["parameters"] = prepared_parameters
     prepared["execution_mode"] = get_execution_mode(task_data)
+
     return prepared
 
 
@@ -1008,6 +658,7 @@ def _resolve_parameter_for_execution(
         return param
 
     raw_value = param.get("parameter_value")
+
     if not raw_value or not isinstance(raw_value, str):
         return param
 
@@ -1020,6 +671,7 @@ def _resolve_parameter_for_execution(
         return param
 
     dados_acesso = parsed_value.get("dados_acesso")
+
     if not isinstance(dados_acesso, dict):
         return param
 
@@ -1045,10 +697,12 @@ def _resolve_parameter_for_execution(
         return param
 
     resolved_dados_acesso = response.get("dados_acesso")
+
     if not isinstance(resolved_dados_acesso, dict):
         return param
 
     final_dados_acesso: dict[str, str | None] = {}
+
     for key_name, original_value in itens.items():
         final_dados_acesso[key_name] = resolved_dados_acesso.get(key_name, original_value)
 
@@ -1059,15 +713,22 @@ def _resolve_parameter_for_execution(
         parsed_value,
         ensure_ascii=False,
     )
+
     return updated_param
 
-
-def _write_task_payload_file(task_data: dict, execution_mode: str | None = None) -> Path:
+def _write_task_payload_file(task_data: dict, execution_mode: str) -> Path:
     TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    task_file = TMP_DIR / f"task_{task_data['task_id']}.json"
+    task_id = task_data.get("task_id") or task_data.get("id")
+
+    if not task_id:
+        raise RuntimeError(f"task_id não encontrado no payload da task: {task_data}")
+
+    task_file = TMP_DIR / f"task_{task_id}.json"
+    temp_file = TMP_DIR / f"task_{task_id}.json.tmp"
+
     payload = {
-        "task_id": task_data.get("task_id"),
+        "task_id": task_id,
         "automation_id": task_data.get("automation_id"),
         "bot_id": task_data.get("bot_id"),
         "bot_version_id": task_data.get("bot_version_id"),
@@ -1078,18 +739,35 @@ def _write_task_payload_file(task_data: dict, execution_mode: str | None = None)
         "requested_start_at": task_data.get("requested_start_at"),
         "timeout_seconds": task_data.get("timeout_seconds"),
         "inactivity_timeout_seconds": task_data.get("inactivity_timeout_seconds"),
-        "execution_mode": execution_mode or get_execution_mode(task_data),
-        "parameters": task_data.get("parameters", []),
+        "execution_mode": execution_mode,
+        "parameters": task_data.get("parameters") or [],
+        "raw_task": task_data,
     }
 
-    task_file.write_text(
-        json.dumps(payload, indent=4, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    content = json.dumps(payload, indent=4, ensure_ascii=False)
+
+    if not content.strip():
+        raise RuntimeError("Payload temporário ficou vazio antes de salvar.")
+
+    temp_file.write_text(content, encoding="utf-8")
+
+    if not temp_file.exists() or temp_file.stat().st_size <= 0:
+        raise RuntimeError(f"Arquivo temporário foi criado vazio: {temp_file}")
+
+    os.replace(temp_file, task_file)
+
+    if not task_file.exists() or task_file.stat().st_size <= 0:
+        raise RuntimeError(f"Arquivo final da task ficou vazio: {task_file}")
+
     return task_file
 
 
-def _send_output_logs(api: TaskApiClient, task_id: int, stdout_text: str, stderr_text: str) -> None:
+def _send_output_logs(
+    api: TaskApiClient,
+    task_id: int,
+    stdout_text: str | None,
+    stderr_text: str | None,
+) -> None:
     sequence = 1
 
     for line in _normalize_lines(stdout_text):
@@ -1112,7 +790,12 @@ def _send_output_logs(api: TaskApiClient, task_id: int, stdout_text: str, stderr
         sequence += 1
 
 
-def _log_process_output_locally(logger, task_id: int, stdout_text: str | None, stderr_text: str | None) -> None:
+def _log_process_output_locally(
+    logger,
+    task_id: int,
+    stdout_text: str | None,
+    stderr_text: str | None,
+) -> None:
     for line in _normalize_lines(stdout_text):
         logger.info("[BOT][task_id=%s] %s", task_id, line)
 
@@ -1125,36 +808,49 @@ def _normalize_lines(text: str | None) -> list[str]:
         return []
 
     lines: list[str] = []
+
     for raw in text.splitlines():
         line = raw.strip()
         if line:
             lines.append(_shorten_text(line, 4000))
+
     return lines
 
 
 def _build_stacktrace(stderr_text: str | None, stdout_text: str | None) -> str | None:
     if stderr_text and stderr_text.strip():
         return _shorten_text(stderr_text, 12000)
+
     if stdout_text and stdout_text.strip():
         return _shorten_text(stdout_text, 12000)
+
     return None
 
 
-def _compose_error_final_message(message: str, stacktrace: str | None, extra: str | None = None) -> str:
+def _compose_error_final_message(
+    message: str,
+    stacktrace: str | None,
+    extra: str | None = None,
+) -> str:
     parts = [message]
+
     if extra:
         parts.append(extra)
+
     if stacktrace:
         parts.append("TRACEBACK:")
         parts.append(_shorten_text(stacktrace, 2500))
+
     return _shorten_text("\n".join(parts), 3500)
 
 
-def _shorten_text(text: str, max_len: int) -> str:
+def _shorten_text(text: str | None, max_len: int) -> str:
     if text is None:
         return ""
+
     if len(text) <= max_len:
         return text
+
     return text[:max_len]
 
 
@@ -1168,11 +864,113 @@ def _kill_process_tree(pid: int) -> None:
     )
 
 
-def _safe_int(value) -> int | None:
-    try:
-        if value is None or value == "":
-            return None
-        return int(value)
-    except Exception:
+def _avg_or_none(values: list[float]) -> float | None:
+    if not values:
         return None
-    
+
+    return round(sum(values) / len(values), 3)
+
+
+def _max_or_none(values: list[float]) -> float | None:
+    if not values:
+        return None
+
+    return round(max(values), 3)
+
+def _reader_thread(pipe, output_queue: queue.Queue, stream_name: str) -> None:
+    try:
+        for line in iter(pipe.readline, ""):
+            if line:
+                output_queue.put((stream_name, line.rstrip()))
+    finally:
+        try:
+            pipe.close()
+        except Exception:
+            pass
+
+def _consume_process_output_live(
+    *,
+    process: subprocess.Popen,
+    timeout_seconds: int,
+    logger,
+    task_id: int,
+    api: TaskApiClient,
+) -> tuple[str, str]:
+    output_queue: queue.Queue = queue.Queue()
+
+    stdout_thread = threading.Thread(
+        target=_reader_thread,
+        args=(process.stdout, output_queue, "stdout"),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_reader_thread,
+        args=(process.stderr, output_queue, "stderr"),
+        daemon=True,
+    )
+
+    stdout_thread.start()
+    stderr_thread.start()
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    start_time = time.time()
+    sequence = 1
+
+    while True:
+        if process.poll() is not None and output_queue.empty():
+            break
+
+        if time.time() - start_time > timeout_seconds:
+            _kill_process_tree(process.pid)
+            raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+
+        try:
+            stream_name, line = output_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+
+        line = _shorten_text(line, 4000)
+
+        if stream_name == "stdout":
+            stdout_lines.append(line)
+            logger.info("[BOT][task_id=%s] %s", task_id, line)
+            level = LOG_LEVEL_INFO
+            error_type = None
+        else:
+            stderr_lines.append(line)
+            logger.error("[BOT][task_id=%s] %s", task_id, line)
+            level = LOG_LEVEL_ERROR
+            error_type = "stderr"
+
+        try:
+            api.send_log(
+                task_id=task_id,
+                level=level,
+                message=line,
+                error_type=error_type,
+                sequence_number=sequence,
+            )
+        except Exception:
+            logger.warning("Falha ao enviar log em tempo real | task_id=%s", task_id)
+
+        sequence += 1
+
+    while True:
+        try:
+            stream_name, line = output_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        line = _shorten_text(line, 4000)
+
+        if stream_name == "stdout":
+            stdout_lines.append(line)
+        else:
+            stderr_lines.append(line)
+
+    stdout_thread.join(timeout=1)
+    stderr_thread.join(timeout=1)
+
+    return "\n".join(stdout_lines), "\n".join(stderr_lines)

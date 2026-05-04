@@ -18,7 +18,6 @@ RESOLVE_CREDENTIAL_PATH = "/api/v1/worker/credentials/{credential_id}/resolve"
 SCREENSHOT_PATH = "/api/v1/worker/screenshot/"
 
 LIST_ACTIVE_TASKS_PATH = "/api/v1/worker/tasks/active"
-RELEASE_LOCK_PATH = "/api/v1/worker/tasks/{task_id}/release-lock"
 RELEASE_STARTUP_LOCKS_PATH = "/api/v1/worker/tasks/release-startup-locks"
 
 
@@ -34,14 +33,13 @@ class TaskApiClient:
             "token": self.runner_token,
         }
 
-    def next_task(self, execution_mode: str) -> dict:
+    def next_task(self, execution_mode: str | None = None) -> dict:
         payload = self._auth_payload()
-        payload["execution_mode"] = execution_mode
 
-        return self.client.post(
-            NEXT_TASK_PATH,
-            payload,
-        )
+        if execution_mode:
+            payload["execution_mode"] = execution_mode
+
+        return self.client.post(NEXT_TASK_PATH, payload)
 
     def claim_task(self, task_id: int) -> dict:
         return self.client.post(
@@ -52,12 +50,6 @@ class TaskApiClient:
     def list_active_tasks(self) -> dict:
         return self.client.post(
             LIST_ACTIVE_TASKS_PATH,
-            self._auth_payload(),
-        )
-
-    def release_task_lock(self, task_id: int) -> dict:
-        return self.client.post(
-            RELEASE_LOCK_PATH.format(task_id=task_id),
             self._auth_payload(),
         )
 
@@ -80,8 +72,10 @@ class TaskApiClient:
 
         if items_processed is not None:
             payload["items_processed"] = items_processed
+
         if items_failed is not None:
             payload["items_failed"] = items_failed
+
         if final_message is not None:
             payload["final_message"] = final_message
 
@@ -126,10 +120,13 @@ class TaskApiClient:
 
         if reference is not None:
             payload["reference"] = reference
+
         if error_type is not None:
             payload["error_type"] = error_type
+
         if sequence_number is not None:
             payload["sequence_number"] = sequence_number
+
         if event_code is not None:
             payload["event_code"] = event_code
 
@@ -214,6 +211,9 @@ class TaskApiClient:
         image_base64: str,
         content_type: str = "image/png",
     ) -> dict:
+        if not image_base64:
+            raise ValueError("image_base64 vazio. Screenshot não enviado.")
+
         payload = self._auth_payload()
         payload["image_base64"] = image_base64
         payload["content_type"] = content_type
@@ -227,6 +227,7 @@ class TaskApiClient:
         payload = self._auth_payload()
         payload["ip"] = ip
         payload["running_tasks"] = running_tasks
+
         return self.client.post(HEARTBEAT_PATH, payload)
 
     def resolve_credential(
@@ -267,39 +268,4 @@ class TaskApiClient:
             payload.update(extra_payload)
 
         return self.client.post(RUNTIME_EVENT_PATH, payload)
-
-    def try_send_runtime_event(
-        self,
-        *,
-        event_type: str,
-        task_id: int | None = None,
-        automation_id: int | None = None,
-        bot_id: int | str | None = None,
-        execution_mode: str | None = None,
-        reason: str | None = None,
-        message: str | None = None,
-        extra_payload: dict | None = None,
-        logger=None,
-    ) -> bool:
-        try:
-            self.send_runtime_event(
-                event_type=event_type,
-                task_id=task_id,
-                automation_id=automation_id,
-                bot_id=bot_id,
-                execution_mode=execution_mode,
-                reason=reason,
-                message=message,
-                extra_payload=extra_payload,
-            )
-            return True
-        except Exception as exc:
-            if logger is not None:
-                logger.warning(
-                    "Falha ao enviar runtime_event | event_type=%s task_id=%s erro=%s",
-                    event_type,
-                    task_id,
-                    exc,
-                )
-            return False
-        
+    

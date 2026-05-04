@@ -1,5 +1,5 @@
 """
-Models dos arquivos locais.
+Models dos arquivos locais do worker.
 """
 
 from datetime import datetime
@@ -19,20 +19,11 @@ class AuthData(BaseModel):
 
 class RunnerConfigData(BaseModel):
     max_concurrency: int = Field(default=1, ge=1)
-    allowed_parallel_bots: dict = Field(default_factory=dict)
-    polling_interval: int = Field(default=15, ge=5)
+    polling_interval: int = Field(default=10, ge=1)
+
     auto_update_bots: bool = True
     install_all_bots_on_register: bool = False
     maintenance_mode: bool = False
-
-    # novos campos para foreground / agente interativo
-    foreground_enabled: bool = True
-    foreground_max_concurrency: int = Field(default=1, ge=1)
-    interactive_agent_required: bool = True
-    interactive_agent_heartbeat_ttl_seconds: int = Field(default=20, ge=5)
-    interactive_agent_poll_interval_seconds: int = Field(default=2, ge=1)
-    interactive_agent_result_poll_interval_seconds: int = Field(default=1, ge=1)
-    interactive_agent_result_ttl_hours: int = Field(default=24, ge=1)
 
 
 class RunnerData(BaseModel):
@@ -46,15 +37,19 @@ class RunnerData(BaseModel):
     os_version: str
     cpu_arch: str
     memory_total: int
+
     access_remote: bool = False
     enabled: bool = True
     status: str = "offline"
-    token_hash: str
+
+    token_hash: str = ""
     runner_token: str
+
     created_at: datetime | None = None
     updated_at: datetime | None = None
     last_heartbeat: datetime | None = None
-    config: RunnerConfigData
+
+    config: RunnerConfigData = Field(default_factory=RunnerConfigData)
 
 
 class BotRegistryItem(BaseModel):
@@ -87,27 +82,9 @@ class BotRegistryItem(BaseModel):
     last_install_message: str | None = None
     linked: bool = True
 
-    # novo campo vindo do backend / sync do bot
     execution_mode: str = "background"
 
 
 class BotsRegistry(BaseModel):
     bots: list[BotRegistryItem] = Field(default_factory=list)
-
-
-class WorkerServiceConfig(BaseModel):
-    service_name: str
-    display_name: str
-    description: str
-    project_root: str
-    working_directory: str
-    python_executable: str
-    runtime_module: str
-    auth_file: str
-    runner_file: str
-    logs_dir: str
-    command: str
-    command_args: str
-    install_hint: str
-    created_at: datetime | None = None
     

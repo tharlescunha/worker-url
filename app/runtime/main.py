@@ -4,12 +4,7 @@ import os
 import time
 
 from app.core.config_models import AuthData, RunnerData
-from app.core.constants import (
-    AUTH_FILE,
-    EXECUTION_MODE_BACKGROUND,
-    EXECUTION_MODE_FOREGROUND,
-    RUNNER_FILE,
-)
+from app.core.constants import AUTH_FILE, RUNNER_FILE
 from app.core.http_client import HttpClient
 from app.core.json_store import load_model, save_model
 from app.core.logging_config import setup_logging
@@ -22,48 +17,10 @@ from app.sync.bot_sync import sync_bots
 
 def recover_runner_startup_tasks(task_api: TaskApiClient, runner: RunnerData, logger) -> None:
     try:
-        response = task_api.list_active_tasks()
-    except Exception as exc:
-        logger.warning(
-            "Falha ao consultar tasks ativas na inicialização | runner_id=%s erro=%s",
-            runner.id,
-            exc,
-        )
-        return
-
-    items = response.get("items", [])
-    total = response.get("total", 0)
-
-    if not isinstance(items, list):
-        logger.warning(
-            "Resposta inesperada ao consultar tasks ativas na inicialização | runner_id=%s response=%s",
-            runner.id,
-            response,
-        )
-        return
-
-    if total <= 0 and not items:
-        return
-
-    logger.warning(
-        "Tasks ativas encontradas no startup | runner_id=%s total=%s",
-        runner.id,
-        total if isinstance(total, int) else len(items),
-    )
-
-    for item in items:
-        logger.warning(
-            "Task ativa identificada | task_id=%s automation_id=%s status=%s",
-            item.get("id"),
-            item.get("automation_id"),
-            item.get("status"),
-        )
-
-    try:
         recovery = task_api.release_startup_locks()
     except Exception as exc:
-        logger.exception(
-            "Falha ao executar recuperação inicial do worker | runner_id=%s erro=%s",
+        logger.warning(
+            "Falha ao executar recuperação inicial | runner_id=%s erro=%s",
             runner.id,
             exc,
         )
@@ -78,7 +35,11 @@ def recover_runner_startup_tasks(task_api: TaskApiClient, runner: RunnerData, lo
     )
 
 
-def _build_task_api(auth: AuthData, access_token: str, runner: RunnerData) -> tuple[HttpClient, TaskApiClient]:
+def build_task_api(
+    auth: AuthData,
+    access_token: str,
+    runner: RunnerData,
+) -> tuple[HttpClient, TaskApiClient]:
     client = HttpClient(base_url=auth.base_url)
     client.set_token(access_token)
 
@@ -87,35 +48,23 @@ def _build_task_api(auth: AuthData, access_token: str, runner: RunnerData) -> tu
         runner_uuid=runner.uuid,
         runner_token=runner.runner_token,
     )
+
     return client, task_api
 
 
-def _should_skip_task_before_claim(
-    *,
-    manager: TaskExecutionManager,
-    task_data: dict,
-) -> tuple[bool, str]:
-    execution_mode = get_execution_mode(task_data)
-
-    if execution_mode == EXECUTION_MODE_FOREGROUND:
-        return True, "Task foreground deve ser executada somente pelo interactive worker."
-
-    if execution_mode != EXECUTION_MODE_BACKGROUND:
-        return True, f"Modo de execução inválido ou não suportado pelo service worker: {execution_mode}"
-
-    can_start_locally, local_reason = manager.can_start_task(task_data)
-    if not can_start_locally:
-        return True, local_reason
-
-    return False, "Task background elegível para claim."
+def fetch_next_task(task_api: TaskApiClient) -> dict:
+    return task_api.next_task(None)
 
 
 def main() -> None:
-    os.environ["ORKAFLOW_WORKER_ROLE"] = "service"
+    os.environ["ORKAFLOW_WORKER_ROLE"] = "local"
 
     logger = setup_logging()
 
-    print("=== INICIANDO RUNTIME DO WORKER ===")
+    print("=== ORKAFLOW WORKER ===")
+    print("Worker iniciado em modo simples.")
+    print("Deixe este terminal aberto para executar as atividades.")
+    print()
 
     auth = load_model(AUTH_FILE, AuthData)
     runner = load_model(RUNNER_FILE, RunnerData)
@@ -126,8 +75,7 @@ def main() -> None:
         return
 
     access_token = unprotect_text(auth.encrypted_access_token)
-
-    client, task_api = _build_task_api(auth, access_token, runner)
+    client, task_api = build_task_api(auth, access_token, runner)
 
     manager = TaskExecutionManager(
         auth=auth,
@@ -136,15 +84,13 @@ def main() -> None:
         logger=logger,
     )
 
-    try:
-        recover_runner_startup_tasks(task_api, runner, logger)
-    except Exception as exc:
-        logger.exception("Erro na recuperação inicial do worker: %s", exc)
+    recover_runner_startup_tasks(task_api, runner, logger)
 
     while True:
         try:
-            sync_bots(client, runner)
-            save_model(RUNNER_FILE, runner)
+            if runner.config.auto_update_bots:
+                sync_bots(client, runner)
+                save_model(RUNNER_FILE, runner)
 
             manager.cleanup_finished()
             active_count = manager.active_count()
@@ -158,49 +104,65 @@ def main() -> None:
                 logger.warning("Falha ao enviar heartbeat: %s", exc)
 
             while manager.has_capacity(runner.config.max_concurrency):
-                next_task = task_api.next_task(EXECUTION_MODE_BACKGROUND)
+                next_task = fetch_next_task(task_api)
 
                 if not next_task.get("found"):
                     break
 
-                task_id = next_task.get("task_id")
+                task_id = int(next_task["task_id"])
                 execution_mode = get_execution_mode(next_task)
 
-                should_skip, skip_reason = _should_skip_task_before_claim(
-                    manager=manager,
-                    task_data=next_task,
-                )
-
-                if should_skip:
+                can_start, reason = manager.can_start_task(next_task)
+                if not can_start:
                     logger.info(
-                        "Task ignorada pelo service worker antes do claim | task_id=%s execution_mode=%s motivo=%s",
+                        "Task ignorada antes do claim | task_id=%s execution_mode=%s motivo=%s",
                         task_id,
                         execution_mode,
-                        skip_reason,
+                        reason,
                     )
                     break
 
                 try:
-                    task_api.claim_task(int(task_id))
+                    task_api.claim_task(task_id)
                 except Exception as exc:
                     logger.warning(
-                        "Falha ao dar claim na task %s: %s",
+                        "Falha ao dar claim na task | task_id=%s erro=%s",
                         task_id,
                         exc,
                     )
                     break
 
                 started = manager.start_task(next_task)
+
                 if not started:
                     logger.warning(
-                        "Task não iniciada localmente após claim | task_id=%s execution_mode=%s",
+                        "Task não iniciada após claim | task_id=%s execution_mode=%s",
                         task_id,
                         execution_mode,
                     )
+
+                    try:
+                        task_api.finish_task(
+                            task_id=task_id,
+                            status="canceled",
+                            final_message=(
+                                "Task cancelada porque o worker não conseguiu "
+                                "iniciar a execução local após o claim."
+                            ),
+                            items_processed=0,
+                            items_failed=1,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Falha ao cancelar task não iniciada após claim | task_id=%s",
+                            task_id,
+                        )
+
                     break
 
+                print(f"Task iniciada | task_id={task_id} | modo={execution_mode}")
                 logger.info(
-                    "Task enviada para execução local pelo service worker | task_id=%s execution_mode=%s",
+                    "Task enviada para execução local | task_id=%s execution_mode=%s",
                     task_id,
                     execution_mode,
                 )
@@ -209,7 +171,7 @@ def main() -> None:
             print(f"[WORKER] erro no ciclo: {exc}")
             logger.exception("Erro no ciclo do worker: %s", exc)
 
-        time.sleep(runner.config.polling_interval)
+        time.sleep(max(1, int(runner.config.polling_interval or 10)))
 
 
 if __name__ == "__main__":
