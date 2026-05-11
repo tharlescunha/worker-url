@@ -154,6 +154,7 @@ def execute_task(
             env=env,
             shell=False,
             bufsize=1,
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
         )
 
         telemetry_collector = ProcessTelemetryCollector(process.pid)
