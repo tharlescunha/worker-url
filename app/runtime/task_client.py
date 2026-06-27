@@ -1,0 +1,385 @@
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Callable
+
+from app.core.constants import LOGS_DIR, RUNTIME_EVENT_PATH
+from app.core.http_client import HttpClient
+
+
+NEXT_TASK_PATH = "/api/v1/worker/tasks/next"
+CLAIM_TASK_PATH = "/api/v1/worker/tasks/{task_id}/claim"
+STATUS_TASK_PATH = "/api/v1/worker/tasks/{task_id}/status"
+FINISH_TASK_PATH = "/api/v1/worker/tasks/{task_id}/finish"
+LOG_TASK_PATH = "/api/v1/worker/tasks/{task_id}/logs"
+ERROR_TASK_PATH = "/api/v1/worker/tasks/{task_id}/errors"
+TELEMETRY_TASK_PATH = "/api/v1/worker/tasks/{task_id}/telemetry"
+HEARTBEAT_PATH = "/api/v1/worker/heartbeat/"
+RESOLVE_CREDENTIAL_PATH = "/api/v1/worker/credentials/{credential_id}/resolve"
+SCREENSHOT_PATH = "/api/v1/worker/screenshot/"
+AUTO_VERSION_PATH = "/api/v1/worker/bot-versions/auto"
+
+LIST_ACTIVE_TASKS_PATH = "/api/v1/worker/tasks/active"
+RELEASE_STARTUP_LOCKS_PATH = "/api/v1/worker/tasks/release-startup-locks"
+
+CRITICAL_REQUEST_ATTEMPTS = 3
+CRITICAL_REQUEST_INITIAL_DELAY_SECONDS = 1.0
+CRITICAL_REQUEST_BACKOFF_FACTOR = 2.0
+CRITICAL_FAILURE_LOG_FILE = LOGS_DIR / "critical_api_failures.jsonl"
+
+
+@dataclass
+class TaskApiClient:
+    client: HttpClient
+    runner_uuid: str
+    runner_token: str
+
+    def _auth_payload(self) -> dict:
+        return {
+            "uuid": self.runner_uuid,
+            "token": self.runner_token,
+        }
+
+    def _with_retry(
+        self,
+        operation: Callable[[], dict],
+        *,
+        operation_name: str,
+        task_id: int | None = None,
+        attempts: int = CRITICAL_REQUEST_ATTEMPTS,
+    ) -> dict:
+        delay = CRITICAL_REQUEST_INITIAL_DELAY_SECONDS
+        last_exc: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                return operation()
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= attempts:
+                    break
+
+                time.sleep(delay)
+                delay *= CRITICAL_REQUEST_BACKOFF_FACTOR
+
+        if last_exc is not None:
+            self._record_critical_failure(
+                operation_name=operation_name,
+                task_id=task_id,
+                error=last_exc,
+                attempts=attempts,
+            )
+            raise last_exc
+
+        raise RuntimeError("Operacao HTTP critica falhou sem excecao registrada.")
+
+    def _record_critical_failure(
+        self,
+        *,
+        operation_name: str,
+        task_id: int | None,
+        error: Exception,
+        attempts: int,
+    ) -> None:
+        try:
+            CRITICAL_FAILURE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            event = {
+                "created_at": datetime.now(UTC).isoformat(),
+                "operation": operation_name,
+                "task_id": task_id,
+                "runner_uuid": self.runner_uuid,
+                "attempts": attempts,
+                "error_type": type(error).__name__,
+                "error": str(error),
+            }
+            with CRITICAL_FAILURE_LOG_FILE.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            return
+
+    def next_task(self, execution_mode: str | None = None) -> dict:
+        payload = self._auth_payload()
+
+        if execution_mode:
+            payload["execution_mode"] = execution_mode
+
+        return self.client.post(NEXT_TASK_PATH, payload)
+
+    def claim_task(self, task_id: int) -> dict:
+        return self._with_retry(
+            lambda: self.client.post(
+                CLAIM_TASK_PATH.format(task_id=task_id),
+                self._auth_payload(),
+            ),
+            operation_name="claim_task",
+            task_id=task_id,
+        )
+
+    def check_task_status(self, task_id: int) -> dict:
+        return self.client.post(
+            STATUS_TASK_PATH.format(task_id=task_id),
+            self._auth_payload(),
+        )
+
+    def list_active_tasks(self) -> dict:
+        return self.client.post(
+            LIST_ACTIVE_TASKS_PATH,
+            self._auth_payload(),
+        )
+
+    def release_startup_locks(self) -> dict:
+        return self.client.post(
+            RELEASE_STARTUP_LOCKS_PATH,
+            self._auth_payload(),
+        )
+
+    def update_status(
+        self,
+        task_id: int,
+        status: str,
+        items_processed: int | None = None,
+        items_failed: int | None = None,
+        final_message: str | None = None,
+        result_json: str | None = None,
+    ) -> dict:
+        payload = self._auth_payload()
+        payload["status"] = status
+
+        if items_processed is not None:
+            payload["items_processed"] = items_processed
+
+        if items_failed is not None:
+            payload["items_failed"] = items_failed
+
+        if final_message is not None:
+            payload["final_message"] = final_message
+
+        if result_json is not None:
+            payload["result_json"] = result_json
+
+        return self._with_retry(
+            lambda: self.client.patch(
+                STATUS_TASK_PATH.format(task_id=task_id),
+                payload,
+            ),
+            operation_name="update_status",
+            task_id=task_id,
+        )
+
+    def finish_task(
+        self,
+        task_id: int,
+        status: str,
+        final_message: str | None = None,
+        items_processed: int = 0,
+        items_failed: int = 0,
+        result_json: str | None = None,
+    ) -> dict:
+        payload = self._auth_payload()
+        payload["status"] = status
+        payload["final_message"] = final_message
+        payload["items_processed"] = items_processed
+        payload["items_failed"] = items_failed
+
+        if result_json is not None:
+            payload["result_json"] = result_json
+
+        return self._with_retry(
+            lambda: self.client.post(
+                FINISH_TASK_PATH.format(task_id=task_id),
+                payload,
+            ),
+            operation_name="finish_task",
+            task_id=task_id,
+        )
+
+    def send_log(
+        self,
+        task_id: int,
+        level: str,
+        message: str,
+        reference: str | None = None,
+        error_type: str | None = None,
+        sequence_number: int | None = None,
+        event_code: str | None = None,
+    ) -> dict:
+        payload = self._auth_payload()
+        payload["level"] = level
+        payload["message"] = message
+        payload["source"] = "worker"
+
+        if reference is not None:
+            payload["reference"] = reference
+
+        if error_type is not None:
+            payload["error_type"] = error_type
+
+        if sequence_number is not None:
+            payload["sequence_number"] = sequence_number
+
+        if event_code is not None:
+            payload["event_code"] = event_code
+
+        return self.client.post(
+            LOG_TASK_PATH.format(task_id=task_id),
+            payload,
+        )
+
+    def send_error(
+        self,
+        task_id: int,
+        error_type: str,
+        message: str,
+        stacktrace: str | None = None,
+        code: str | None = None,
+        is_retryable: bool = False,
+    ) -> dict:
+        payload = self._auth_payload()
+        payload["error_type"] = error_type
+        payload["message"] = message
+        payload["stacktrace"] = stacktrace
+        payload["source"] = "worker"
+        payload["is_retryable"] = is_retryable
+
+        if code is not None:
+            payload["code"] = code
+
+        return self._with_retry(
+            lambda: self.client.post(
+                ERROR_TASK_PATH.format(task_id=task_id),
+                payload,
+            ),
+            operation_name="send_error",
+            task_id=task_id,
+        )
+
+    def send_telemetry(
+        self,
+        task_id: int,
+        *,
+        captured_at: str,
+        execution_started_at: str | None = None,
+        execution_finished_at: str | None = None,
+        duration_seconds: float | None = None,
+        cpu_percent_avg: float | None = None,
+        cpu_percent_peak: float | None = None,
+        memory_used_mb_avg: float | None = None,
+        memory_used_mb_peak: float | None = None,
+        process_memory_mb_peak: float | None = None,
+        disk_read_mb: float | None = None,
+        disk_write_mb: float | None = None,
+        net_sent_mb: float | None = None,
+        net_recv_mb: float | None = None,
+        exit_code: int | None = None,
+        telemetry_status: str | None = None,
+        message: str | None = None,
+        payload_json: str | None = None,
+    ) -> dict:
+        payload = self._auth_payload()
+        payload["captured_at"] = captured_at
+        payload["execution_started_at"] = execution_started_at
+        payload["execution_finished_at"] = execution_finished_at
+        payload["duration_seconds"] = duration_seconds
+        payload["cpu_percent_avg"] = cpu_percent_avg
+        payload["cpu_percent_peak"] = cpu_percent_peak
+        payload["memory_used_mb_avg"] = memory_used_mb_avg
+        payload["memory_used_mb_peak"] = memory_used_mb_peak
+        payload["process_memory_mb_peak"] = process_memory_mb_peak
+        payload["disk_read_mb"] = disk_read_mb
+        payload["disk_write_mb"] = disk_write_mb
+        payload["net_sent_mb"] = net_sent_mb
+        payload["net_recv_mb"] = net_recv_mb
+        payload["exit_code"] = exit_code
+        payload["telemetry_status"] = telemetry_status
+        payload["message"] = message
+        payload["payload_json"] = payload_json
+
+        return self._with_retry(
+            lambda: self.client.post(
+                TELEMETRY_TASK_PATH.format(task_id=task_id),
+                payload,
+            ),
+            operation_name="send_telemetry",
+            task_id=task_id,
+        )
+
+    def send_screenshot(
+        self,
+        *,
+        image_base64: str,
+        content_type: str = "image/png",
+    ) -> dict:
+        if not image_base64:
+            raise ValueError("image_base64 vazio. Screenshot não enviado.")
+
+        payload = self._auth_payload()
+        payload["image_base64"] = image_base64
+        payload["content_type"] = content_type
+
+        return self.client.post(
+            SCREENSHOT_PATH,
+            payload,
+        )
+
+    def heartbeat(self, ip: str | None = None, running_tasks: int = 0) -> dict:
+        payload = self._auth_payload()
+        payload["ip"] = ip
+        payload["running_tasks"] = running_tasks
+
+        return self.client.post(HEARTBEAT_PATH, payload)
+
+    def resolve_credential(
+        self,
+        credential_id: int,
+        keys: list[str] | None = None,
+    ) -> dict:
+        payload = self._auth_payload()
+        payload["keys"] = keys or []
+
+        return self.client.post(
+            RESOLVE_CREDENTIAL_PATH.format(credential_id=credential_id),
+            payload,
+        )
+
+    def send_runtime_event(
+        self,
+        *,
+        event_type: str,
+        task_id: int | None = None,
+        automation_id: int | None = None,
+        bot_id: int | str | None = None,
+        execution_mode: str | None = None,
+        reason: str | None = None,
+        message: str | None = None,
+        extra_payload: dict | None = None,
+    ) -> dict:
+        payload = self._auth_payload()
+        payload["event_type"] = event_type
+        payload["task_id"] = task_id
+        payload["automation_id"] = automation_id
+        payload["bot_id"] = bot_id
+        payload["execution_mode"] = execution_mode
+        payload["reason"] = reason
+        payload["message"] = message
+
+        if extra_payload:
+            payload.update(extra_payload)
+
+        return self.client.post(RUNTIME_EVENT_PATH, payload)
+
+    def register_auto_version(
+        self,
+        *,
+        bot_id: int | str,
+        commit_hash: str,
+        branch: str | None = None,
+    ) -> dict:
+        payload = self._auth_payload()
+        payload["bot_id"] = int(bot_id)
+        payload["commit_hash"] = commit_hash
+        payload["branch"] = branch
+
+        return self.client.post(AUTO_VERSION_PATH, payload)
