@@ -15,6 +15,7 @@ import psutil
 from app.core.config_models import BotRegistryItem, BotsRegistry, RunnerData
 from app.core.constants import (
     BLOCK_FOREGROUND_WHEN_SESSION_LOCKED,
+    DEFAULT_INACTIVITY_TIMEOUT_SECONDS,
     BOTS_REGISTRY_FILE,
     EXECUTION_MODE_BACKGROUND,
     EXECUTION_MODE_FOREGROUND,
@@ -66,6 +67,10 @@ STDERR_ERROR_MARKERS = (
     "fatal",
     "critical",
 )
+
+
+class TaskInactivityTimeout(subprocess.TimeoutExpired):
+    """O robô ficou tempo demais sem emitir qualquer linha de saída."""
 
 
 class TaskStopRequested(RuntimeError):
@@ -223,6 +228,7 @@ def execute_task(
         stdout_text, stderr_text = _consume_process_output_live(
             process=process,
             timeout_seconds=timeout_seconds,
+            inactivity_timeout_seconds=_resolve_inactivity_timeout(task_data),
             logger=logger,
             task_id=task_id,
             api=api,
@@ -351,11 +357,20 @@ def execute_task(
         logger.warning("Task interrompida por parada remota | task_id=%s", task_id)
         print(f"Task interrompida por parada remota | task_id={task_id}")
 
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as timeout_exc:
         if process and process.pid:
             _kill_process_tree(process.pid)
 
-        timeout_message = "Task excedeu o timeout e foi encerrada pelo worker."
+        is_inactivity = isinstance(timeout_exc, TaskInactivityTimeout)
+        timeout_message = (
+            (
+                f"Task encerrada pelo worker: o robô ficou {int(timeout_exc.timeout)}s "
+                "sem emitir nenhuma saída (possível travamento)."
+            )
+            if is_inactivity
+            else "Task excedeu o timeout e foi encerrada pelo worker."
+        )
+        timeout_code = "INACTIVITY_TIMEOUT" if is_inactivity else "TIMEOUT"
 
         telemetry = None
         if telemetry_collector is not None:
@@ -395,7 +410,7 @@ def execute_task(
                 error_type="timeout",
                 message=timeout_message,
                 stacktrace="TimeoutExpired",
-                code="TIMEOUT",
+                code=timeout_code,
                 is_retryable=False,
             )
             final_message = _compose_error_final_message(timeout_message, "TimeoutExpired")
@@ -1472,10 +1487,21 @@ class AsyncTaskLogSender:
             finally:
                 self.queue.task_done()
 
+def _resolve_inactivity_timeout(task_data: dict) -> int:
+    """Limite de silêncio da task; sem valor (ou <= 0) usa o padrão do orquestrador."""
+    try:
+        value = int(task_data.get("inactivity_timeout_seconds") or 0)
+    except (TypeError, ValueError):
+        value = 0
+
+    return value if value > 0 else DEFAULT_INACTIVITY_TIMEOUT_SECONDS
+
+
 def _consume_process_output_live(
     *,
     process: subprocess.Popen,
     timeout_seconds: int,
+    inactivity_timeout_seconds: int = DEFAULT_INACTIVITY_TIMEOUT_SECONDS,
     logger,
     task_id: int,
     api: TaskApiClient,
@@ -1500,6 +1526,7 @@ def _consume_process_output_live(
     stderr_lines: list[str] = []
 
     start_time = time.time()
+    last_output_at = start_time
     last_status_check_at = 0.0
     sequence = 1
     log_sender = AsyncTaskLogSender(api=api, task_id=task_id, logger=logger)
@@ -1513,6 +1540,10 @@ def _consume_process_output_live(
             if time.time() - start_time > timeout_seconds:
                 _kill_process_tree(process.pid)
                 raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+
+            if time.time() - last_output_at > inactivity_timeout_seconds:
+                _kill_process_tree(process.pid)
+                raise TaskInactivityTimeout(process.args, inactivity_timeout_seconds)
 
             if time.time() - last_status_check_at >= STOP_STATUS_CHECK_INTERVAL_SECONDS:
                 last_status_check_at = time.time()
@@ -1528,6 +1559,7 @@ def _consume_process_output_live(
             except queue.Empty:
                 continue
 
+            last_output_at = time.time()
             line = _shorten_text(line, 4000)
 
             if stream_name == "stdout":

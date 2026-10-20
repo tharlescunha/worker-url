@@ -307,5 +307,69 @@ class LogCleanupTests(unittest.TestCase):
             self.assertTrue(fresh_task.exists())
 
 
+class InactivityTimeoutTests(unittest.TestCase):
+    class _FakeApi:
+        def check_task_status(self, task_id):
+            return {}
+
+        def send_log(self, **kwargs):
+            return {}
+
+    def _run(self, code: str, inactivity: int, timeout: int = 60):
+        import subprocess as sp
+
+        from app.runtime import task_executor as te
+
+        process = sp.Popen(
+            [sys.executable, "-u", "-c", code],
+            stdout=sp.PIPE,
+            stderr=sp.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        try:
+            return te._consume_process_output_live(
+                process=process,
+                timeout_seconds=timeout,
+                inactivity_timeout_seconds=inactivity,
+                logger=logging.getLogger("test"),
+                task_id=1,
+                api=self._FakeApi(),
+            )
+        finally:
+            if process.poll() is None:
+                process.kill()
+
+    def test_silent_process_is_killed_after_inactivity_limit(self):
+        from app.runtime.task_executor import TaskInactivityTimeout
+
+        started = time.time()
+        with self.assertRaises(TaskInactivityTimeout) as ctx:
+            self._run("import time; time.sleep(60)", inactivity=2)
+
+        self.assertEqual(ctx.exception.timeout, 2)
+        self.assertLess(time.time() - started, 20)
+
+    def test_process_that_keeps_printing_is_not_killed(self):
+        code = "; ".join(
+            [
+                "import time",
+                "[(print('vivo', i, flush=True), time.sleep(0.5)) for i in range(6)]",
+            ]
+        )
+        stdout, _ = self._run(code, inactivity=2)
+        self.assertIn("vivo 5", stdout)
+
+    def test_default_and_per_task_inactivity_value(self):
+        from app.core.constants import DEFAULT_INACTIVITY_TIMEOUT_SECONDS
+        from app.runtime.task_executor import _resolve_inactivity_timeout
+
+        self.assertEqual(DEFAULT_INACTIVITY_TIMEOUT_SECONDS, 600)
+        self.assertEqual(_resolve_inactivity_timeout({}), 600)
+        self.assertEqual(_resolve_inactivity_timeout({"inactivity_timeout_seconds": 0}), 600)
+        self.assertEqual(_resolve_inactivity_timeout({"inactivity_timeout_seconds": None}), 600)
+        self.assertEqual(_resolve_inactivity_timeout({"inactivity_timeout_seconds": 120}), 120)
+
+
 if __name__ == "__main__":
     unittest.main()

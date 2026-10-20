@@ -55,6 +55,10 @@ SUPERVISOR_STARTUP_GRACE_SECONDS = 180
 
 HEARTBEAT_INTERVAL_SECONDS = 10
 
+# Robô sem nenhuma saída (stdout/stderr) por este tempo é considerado travado e é
+# encerrado pelo worker. A task pode sobrescrever com inactivity_timeout_seconds.
+DEFAULT_INACTIVITY_TIMEOUT_SECONDS = 600
+
 # Retenção de arquivos de log/tmp
 LOG_RETENTION_DAYS = 5
 LOG_MAX_FILE_BYTES = 20 * 1024 * 1024
