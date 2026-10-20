@@ -12,18 +12,31 @@ import queue
 
 import psutil
 
-from app.core.config_models import AuthData, BotRegistryItem, BotsRegistry, RunnerData
+from app.core.config_models import BotRegistryItem, BotsRegistry, RunnerData
 from app.core.constants import (
+    BLOCK_FOREGROUND_WHEN_SESSION_LOCKED,
     BOTS_REGISTRY_FILE,
     EXECUTION_MODE_BACKGROUND,
     EXECUTION_MODE_FOREGROUND,
+    RUNTIME_EVENT_TYPE_BOT_AUTO_UPDATE_FAILED,
+    RUNTIME_EVENT_TYPE_BOT_INSTALL_FAILED,
+    RUNTIME_EVENT_TYPE_FOREGROUND_SESSION,
     TMP_DIR,
 )
 from app.core.http_client import HttpClient
 from app.core.json_store import load_model, save_model
-from app.runtime.screenshot_reporter import ScreenshotReporter
+from app.runtime.bot_usage import REGISTRY_LOCK, bot_usage
+from app.runtime.events import EventReporter
+from app.runtime.screenshot_reporter import acquire_screenshots, release_screenshots
+from app.runtime.services import describe_session, is_input_desktop_available
 from app.runtime.task_client import TaskApiClient
-from app.sync.bot_installer import git_pull_for_auto_update, install_or_update_bot, resolve_bot_install_paths
+from app.sync.bot_installer import (
+    git_pull_for_auto_update,
+    install_or_update_bot,
+    needs_install,
+    register_install_failure,
+    register_install_success,
+)
 
 
 LOG_LEVEL_INFO = "info"
@@ -75,15 +88,14 @@ def get_execution_mode(task_data: dict) -> str:
 
 
 def execute_task(
-    auth: AuthData,
-    access_token: str,
+    client: HttpClient,
     runner: RunnerData,
     task_data: dict,
     logger,
+    events: EventReporter | None = None,
 ) -> None:
-    client = HttpClient(base_url=auth.base_url)
-    client.set_token(access_token)
-
+    # O client é compartilhado e renova o token sozinho (hook on_unauthorized),
+    # então tasks longas não ficam presas por token vencido.
     api = TaskApiClient(
         client=client,
         runner_uuid=runner.uuid,
@@ -97,18 +109,33 @@ def execute_task(
     task_file: Path | None = None
     result_file: Path | None = None
     telemetry_collector: ProcessTelemetryCollector | None = None
-    screenshot_reporter: ScreenshotReporter | None = None
+    screenshots_acquired = False
+    bot_running = None
 
     execution_started_at = datetime.now(UTC)
 
     try:
         bot = _resolve_bot_for_task(task_data)
+        _warn_if_foreground_session_unavailable(
+            execution_mode=execution_mode,
+            api=api,
+            task_id=task_id,
+            logger=logger,
+            events=events,
+        )
+
         bot = _ensure_bot_ready(
             bot,
             api=api,
             task_id=task_id,
             logger=logger,
+            events=events,
         )
+
+        # Marca o bot como "em uso": sync e auto-update não mexem nos arquivos
+        # dele enquanto esta execução estiver rodando.
+        bot_running = bot_usage.running(bot.bot_id)
+        bot_running.__enter__()
 
         python_exe = Path(bot.venv_path) / "Scripts" / "python.exe"
         entrypoint = Path(bot.local_path) / (bot.entrypoint or "main.py")
@@ -137,12 +164,8 @@ def execute_task(
             final_message="Task iniciada pelo worker.",
         )
 
-        screenshot_reporter = ScreenshotReporter(
-            api=api,
-            interval_seconds=10,
-            logger=logger,
-        )
-        screenshot_reporter.start()
+        acquire_screenshots(api, logger)
+        screenshots_acquired = True
 
         timeout_seconds = int(
             task_data.get("timeout_seconds")
@@ -468,11 +491,17 @@ def execute_task(
         print(f"Task finalizada com erro | task_id={task_id}")
 
     finally:
-        if screenshot_reporter is not None:
+        if screenshots_acquired:
             try:
-                screenshot_reporter.stop(send_final=True)
+                release_screenshots(logger)
             except Exception:
                 logger.exception("Falha ao finalizar ScreenshotReporter | task_id=%s", task_id)
+
+        if bot_running is not None:
+            try:
+                bot_running.__exit__(None, None, None)
+            except Exception:
+                logger.exception("Falha ao liberar uso do bot | task_id=%s", task_id)
 
         if telemetry_collector is not None:
             telemetry_collector.ensure_stopped()
@@ -696,13 +725,54 @@ def _resolve_bot_for_task(task_data: dict) -> BotRegistryItem:
     )
 
 
+def _warn_if_foreground_session_unavailable(
+    *,
+    execution_mode: str,
+    api: TaskApiClient,
+    task_id: int,
+    logger,
+    events: EventReporter | None,
+) -> None:
+    """
+    Automação com foco (SAP GUI etc.) precisa de sessão Windows ativa e
+    desbloqueada. Por padrão só avisa (log da task + evento); com
+    BLOCK_FOREGROUND_WHEN_SESSION_LOCKED = True a task falha com mensagem clara.
+    """
+    if execution_mode != EXECUTION_MODE_FOREGROUND:
+        return
+
+    if is_input_desktop_available():
+        return
+
+    message = (
+        "A sessão do Windows parece bloqueada ou desconectada; automações com foco "
+        f"de tela podem falhar. ({describe_session()})"
+    )
+
+    _send_worker_task_log(api, task_id, logger, message, level=LOG_LEVEL_WARNING)
+
+    if events is not None:
+        events.report(
+            RUNTIME_EVENT_TYPE_FOREGROUND_SESSION,
+            message,
+            reason="session_locked",
+            task_id=task_id,
+            execution_mode=execution_mode,
+        )
+
+    if BLOCK_FOREGROUND_WHEN_SESSION_LOCKED:
+        raise RuntimeError(message)
+
+
 def _ensure_bot_ready(
     bot: BotRegistryItem,
     api: TaskApiClient,
     task_id: int,
     logger,
+    events: EventReporter | None = None,
 ) -> BotRegistryItem:
-    registry = load_model(BOTS_REGISTRY_FILE, BotsRegistry)
+    with REGISTRY_LOCK:
+        registry = load_model(BOTS_REGISTRY_FILE, BotsRegistry)
 
     if not registry:
         raise RuntimeError("bots_registry.json não encontrado.")
@@ -720,77 +790,142 @@ def _ensure_bot_ready(
     if not target.linked:
         raise RuntimeError(f"Bot {target.bot_id} está desvinculado do runner.")
 
+    force_reinstall = False
+
     if target.auto_update and target.local_path:
-        from pathlib import Path as _Path
-        bot_dir = _Path(target.local_path)
-        try:
-            new_commit = git_pull_for_auto_update(
-                bot_dir,
-                branch=target.branch,
-                progress_callback=lambda msg: _send_worker_task_log(api, task_id, logger, msg),
-            )
-            if new_commit and new_commit != target.installed_commit:
-                _send_worker_task_log(
-                    api, task_id, logger,
-                    f"auto_update: novo commit detectado {new_commit[:12]} — bot sera reinstalado.",
-                )
-                target.installed_commit = None
-                try:
-                    api.register_auto_version(
-                        bot_id=target.bot_id,
-                        commit_hash=new_commit,
-                        branch=target.branch,
-                    )
-                except Exception as exc:
-                    logger.warning("Falha ao registrar auto_version no backend | bot_id=%s erro=%s", target.bot_id, exc)
-        except Exception as exc:
-            logger.warning("Falha no auto_update do bot %s: %s", target.bot_id, exc)
+        # Atualização automática: git pull forçado a cada execução, sem validar
+        # versão. Se o bot já está rodando em outra task, adia (não troca os
+        # arquivos debaixo de uma execução em andamento).
+        exclusive = bot_usage.try_exclusive(target.bot_id)
 
-    needs_prepare = False
-    expected_bot_dir, expected_venv_dir = resolve_bot_install_paths(target)
-
-    if not target.local_path or not target.venv_path:
-        needs_prepare = True
-    elif Path(target.local_path) != expected_bot_dir:
-        needs_prepare = True
-    elif Path(target.venv_path) != expected_venv_dir:
-        needs_prepare = True
-    elif target.installed_version != target.expected_version:
-        needs_prepare = True
-    elif target.expected_commit and target.installed_commit != target.expected_commit:
-        needs_prepare = True
-    elif target.last_install_status in ("error", "not_installed", "outdated"):
-        needs_prepare = True
-
-    if needs_prepare:
-        _send_worker_task_log(
-            api,
-            task_id,
-            logger,
-            f"Bot {target.name or target.bot_id} precisa ser preparado antes da task.",
-        )
-
-        result = install_or_update_bot(
-            target,
-            progress_callback=lambda message: _send_worker_task_log(
+        if exclusive is None:
+            _send_worker_task_log(
                 api,
                 task_id,
                 logger,
-                message,
-            ),
-        )
+                "auto_update adiado: o bot já está em execução em outra task.",
+            )
+        else:
+            try:
+                with exclusive:
+                    new_commit = git_pull_for_auto_update(
+                        Path(target.local_path),
+                        branch=target.branch,
+                        progress_callback=lambda msg: _send_worker_task_log(api, task_id, logger, msg),
+                    )
 
-        target.local_path = result.local_path
-        target.venv_path = result.venv_path
-        target.installed_version = target.expected_version
-        target.installed_commit = result.installed_commit
-        target.requirements_hash = result.requirements_hash
-        target.last_install_status = "ok"
-        target.last_install_message = result.message
+                if new_commit and new_commit != target.installed_commit:
+                    _send_worker_task_log(
+                        api,
+                        task_id,
+                        logger,
+                        f"auto_update: novo commit {new_commit[:12]} — dependências serão revalidadas.",
+                    )
+                    force_reinstall = True
 
-        save_model(BOTS_REGISTRY_FILE, registry)
+                    try:
+                        api.register_auto_version(
+                            bot_id=target.bot_id,
+                            commit_hash=new_commit,
+                            branch=target.branch,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Falha ao registrar auto_version no backend | bot_id=%s erro=%s",
+                            target.bot_id,
+                            exc,
+                        )
+            except Exception as exc:
+                message = (
+                    f"auto_update falhou ({exc}). Executando com a versão local "
+                    f"do bot {target.name or target.bot_id}."
+                )
+                logger.warning("Falha no auto_update do bot %s: %s", target.bot_id, exc)
+                _send_worker_task_log(api, task_id, logger, message, level=LOG_LEVEL_WARNING)
+
+                if events is not None:
+                    events.report(
+                        RUNTIME_EVENT_TYPE_BOT_AUTO_UPDATE_FAILED,
+                        message,
+                        reason="git_pull_failed",
+                        task_id=task_id,
+                        bot_id=target.bot_id,
+                    )
+
+    if not (force_reinstall or needs_install(target)):
+        return target
+
+    _send_worker_task_log(
+        api,
+        task_id,
+        logger,
+        f"Bot {target.name or target.bot_id} precisa ser preparado antes da task.",
+    )
+
+    with bot_usage.exclusive(target.bot_id):
+        # Outra task pode ter preparado o bot enquanto esta esperava a vez.
+        with REGISTRY_LOCK:
+            fresh = load_model(BOTS_REGISTRY_FILE, BotsRegistry)
+
+        if fresh:
+            for item in fresh.bots:
+                if item.bot_id == target.bot_id:
+                    target = item
+                    break
+
+        if force_reinstall or needs_install(target):
+            try:
+                result = install_or_update_bot(
+                    target,
+                    progress_callback=lambda message: _send_worker_task_log(
+                        api,
+                        task_id,
+                        logger,
+                        message,
+                    ),
+                )
+            except Exception as exc:
+                target.last_install_status = "error"
+                target.last_install_message = str(exc)
+                register_install_failure(target, datetime.now(UTC))
+                _save_bot_in_registry(target)
+
+                if events is not None:
+                    events.report(
+                        RUNTIME_EVENT_TYPE_BOT_INSTALL_FAILED,
+                        f"Falha ao preparar bot {target.name or target.bot_id}: {exc}",
+                        reason="install_failed",
+                        task_id=task_id,
+                        bot_id=target.bot_id,
+                    )
+                raise
+
+            target.local_path = result.local_path
+            target.venv_path = result.venv_path
+            target.installed_version = target.expected_version
+            target.installed_commit = result.installed_commit
+            target.requirements_hash = result.requirements_hash
+            target.last_install_status = "ok"
+            target.last_install_message = result.message
+            register_install_success(target)
+            _save_bot_in_registry(target)
 
     return target
+
+
+def _save_bot_in_registry(bot: BotRegistryItem) -> None:
+    """Atualiza só este bot no registry, sem perder alterações de outras threads."""
+    with REGISTRY_LOCK:
+        registry = load_model(BOTS_REGISTRY_FILE, BotsRegistry) or BotsRegistry(bots=[])
+
+        for index, item in enumerate(registry.bots):
+            if item.bot_id == bot.bot_id:
+                registry.bots[index] = bot
+                break
+        else:
+            registry.bots.append(bot)
+
+        save_model(BOTS_REGISTRY_FILE, registry)
 
 
 def _prepare_task_data_for_execution(
@@ -866,12 +1001,17 @@ def _resolve_parameter_for_execution(
             credential_id,
             exc,
         )
-        return param
+        # Não roda o bot sem credencial: a task falha com erro claro.
+        raise RuntimeError(
+            f"Não foi possível obter a credencial {credential_id} no backend: {exc}"
+        ) from exc
 
     resolved_dados_acesso = response.get("dados_acesso")
 
     if not isinstance(resolved_dados_acesso, dict):
-        return param
+        raise RuntimeError(
+            f"O backend devolveu uma resposta inválida para a credencial {credential_id}."
+        )
 
     final_dados_acesso: dict[str, str | None] = {}
 

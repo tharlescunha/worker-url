@@ -1,29 +1,38 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Callable
 
 from app.core.config_models import BotRegistryItem, BotsRegistry
 from app.core.constants import BOTS_REGISTRY_FILE
 from app.core.http_client import HttpClient
 from app.core.json_store import load_model, save_model
-from app.sync.bot_installer import install_or_update_bot, resolve_bot_install_paths
+from app.runtime.bot_usage import REGISTRY_LOCK, bot_usage
+from app.sync.bot_installer import (
+    install_or_update_bot,
+    install_retry_allowed,
+    needs_install,
+    register_install_failure,
+    register_install_success,
+)
 
 
 SYNC_PATH = "/api/v1/worker/sync"
 ProgressCallback = Callable[[str], None]
+FailureCallback = Callable[[BotRegistryItem, str], None]
 
 
 def load_registry() -> BotsRegistry:
-    data = load_model(BOTS_REGISTRY_FILE, BotsRegistry)
+    with REGISTRY_LOCK:
+        data = load_model(BOTS_REGISTRY_FILE, BotsRegistry)
     if not data:
         return BotsRegistry(bots=[])
     return data
 
 
 def save_registry(registry: BotsRegistry) -> None:
-    save_model(BOTS_REGISTRY_FILE, registry)
+    with REGISTRY_LOCK:
+        save_model(BOTS_REGISTRY_FILE, registry)
 
 
 def find_local_bot(registry: BotsRegistry, bot_id: str) -> BotRegistryItem | None:
@@ -37,6 +46,7 @@ def sync_bots(
     client: HttpClient,
     runner_data,
     progress_callback: ProgressCallback | None = None,
+    failure_callback: FailureCallback | None = None,
 ) -> dict:
     payload = {
         "uuid": runner_data.uuid,
@@ -54,6 +64,7 @@ def sync_bots(
     installed_count = 0
     updated_count = 0
     failed_count = 0
+    deferred_count = 0
 
     for bot_data in remote_bots:
         bot_id = str(bot_data.get("bot_id") or bot_data.get("id") or "")
@@ -89,21 +100,35 @@ def sync_bots(
         current.auto_update = bool(bot_data.get("auto_update", False))
         current.last_sync_at = datetime.now(timezone.utc)
 
-        needs_install = _needs_install(current)
+        if needs_install(current):
+            now = datetime.now(timezone.utc)
 
-        if needs_install:
+            if not install_retry_allowed(current, now):
+                # Falhou há pouco: espera o intervalo de backoff antes de tentar de novo.
+                updated_items.append(current)
+                continue
+
+            exclusive = bot_usage.try_exclusive(current.bot_id)
+
+            if exclusive is None:
+                # Bot em execução agora: não mexe nos arquivos dele, tenta no próximo ciclo.
+                deferred_count += 1
+                updated_items.append(current)
+                continue
+
             try:
-                had_local_install = bool(current.local_path and current.venv_path)
+                with exclusive:
+                    had_local_install = bool(current.local_path and current.venv_path)
 
-                _notify(
-                    progress_callback,
-                    f"Bot {current.name or current.bot_id} precisa ser preparado pelo worker.",
-                )
+                    _notify(
+                        progress_callback,
+                        f"Bot {current.name or current.bot_id} precisa ser preparado pelo worker.",
+                    )
 
-                result = install_or_update_bot(
-                    current,
-                    progress_callback=progress_callback,
-                )
+                    result = install_or_update_bot(
+                        current,
+                        progress_callback=progress_callback,
+                    )
 
                 current.local_path = result.local_path
                 current.venv_path = result.venv_path
@@ -112,6 +137,7 @@ def sync_bots(
                 current.requirements_hash = result.requirements_hash
                 current.last_install_status = "ok"
                 current.last_install_message = result.message
+                register_install_success(current)
 
                 if had_local_install:
                     updated_count += 1
@@ -121,14 +147,20 @@ def sync_bots(
             except Exception as exc:
                 current.last_install_status = "error"
                 current.last_install_message = str(exc)
+                register_install_failure(current, datetime.now(timezone.utc))
                 _notify(
                     progress_callback,
-                    f"Falha ao preparar bot {current.name or current.bot_id}: {exc}",
+                    f"Falha ao preparar bot {current.name or current.bot_id}: {exc} "
+                    f"(nova tentativa após {current.next_install_retry_at})",
                 )
                 failed_count += 1
+
+                if failure_callback:
+                    failure_callback(current, str(exc))
         else:
             current.last_install_status = "ok"
             current.last_install_message = "Bot alinhado com a versão esperada."
+            register_install_success(current)
 
         updated_items.append(current)
 
@@ -139,8 +171,7 @@ def sync_bots(
             local_bot.last_install_message = "Bot não retornou no sync atual."
             updated_items.append(local_bot)
 
-    new_registry = BotsRegistry(bots=updated_items)
-    save_registry(new_registry)
+    _merge_and_save(updated_items)
 
     runner_data.config.polling_interval = response.get(
         "polling_interval",
@@ -151,12 +182,13 @@ def sync_bots(
         runner_data.config.max_concurrency,
     )
 
-    if installed_count or updated_count or failed_count:
+    if installed_count or updated_count or failed_count or deferred_count:
         _notify(
             progress_callback,
             (
                 "Sync de bots concluido pelo worker: "
-                f"instalados={installed_count} atualizados={updated_count} falhas={failed_count}"
+                f"instalados={installed_count} atualizados={updated_count} "
+                f"falhas={failed_count} adiados_por_uso={deferred_count}"
             ),
         )
 
@@ -166,35 +198,50 @@ def sync_bots(
         "installed": installed_count,
         "updated": updated_count,
         "failed": failed_count,
+        "deferred": deferred_count,
         "polling_interval": response.get("polling_interval"),
         "max_concurrency": response.get("max_concurrency"),
     }
 
 
+def _merge_and_save(updated_items: list[BotRegistryItem]) -> None:
+    """
+    Grava o registry sem sobrescrever o que tasks em execução alteraram durante
+    o sync (instalações feitas pela própria task, commit instalado etc.).
+    """
+    with REGISTRY_LOCK:
+        fresh = load_model(BOTS_REGISTRY_FILE, BotsRegistry) or BotsRegistry(bots=[])
+        fresh_by_id = {bot.bot_id: bot for bot in fresh.bots}
+
+        merged: list[BotRegistryItem] = []
+
+        for item in updated_items:
+            current = fresh_by_id.get(item.bot_id)
+
+            # Se uma task preparou este bot enquanto o sync rodava, mantém os
+            # dados de instalação mais novos dela.
+            if (
+                current is not None
+                and current.last_install_status == "ok"
+                and current.installed_commit
+                and item.last_install_status != "ok"
+                and not item.installed_commit
+            ):
+                item.local_path = current.local_path
+                item.venv_path = current.venv_path
+                item.installed_version = current.installed_version
+                item.installed_commit = current.installed_commit
+                item.requirements_hash = current.requirements_hash
+                item.last_install_status = current.last_install_status
+                item.last_install_message = current.last_install_message
+                item.install_failures = 0
+                item.next_install_retry_at = None
+
+            merged.append(item)
+
+        save_model(BOTS_REGISTRY_FILE, BotsRegistry(bots=merged))
+
+
 def _notify(progress_callback: ProgressCallback | None, message: str) -> None:
     if progress_callback:
         progress_callback(message)
-
-
-def _needs_install(bot: BotRegistryItem) -> bool:
-    if not bot.local_path or not bot.venv_path:
-        return True
-
-    expected_bot_dir, expected_venv_dir = resolve_bot_install_paths(bot)
-
-    if Path(bot.local_path) != expected_bot_dir:
-        return True
-
-    if Path(bot.venv_path) != expected_venv_dir:
-        return True
-
-    if bot.installed_version != bot.expected_version:
-        return True
-
-    if bot.expected_commit and bot.installed_commit != bot.expected_commit:
-        return True
-
-    if bot.last_install_status in ("error", "not_installed", "outdated"):
-        return True
-
-    return False

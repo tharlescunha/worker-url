@@ -107,3 +107,38 @@ class ScreenshotReporter:
 
             return base64.b64encode(buffer.getvalue()).decode("utf-8")
         
+
+# --- Uso compartilhado entre várias tasks simultâneas -------------------------
+# O print é da tela da máquina (não da task), então um único reporter atende
+# todas as tasks em andamento: inicia na primeira e finaliza quando a última sai.
+
+_shared_lock = threading.Lock()
+_shared_reporter: ScreenshotReporter | None = None
+_shared_refs = 0
+
+
+def acquire_screenshots(api: TaskApiClient, logger=None) -> None:
+    global _shared_reporter, _shared_refs
+
+    with _shared_lock:
+        _shared_refs += 1
+
+        if _shared_refs == 1:
+            _shared_reporter = ScreenshotReporter(
+                api=api,
+                interval_seconds=SCREENSHOT_INTERVAL_SECONDS,
+                logger=logger,
+            )
+            _shared_reporter.start()
+
+
+def release_screenshots(logger=None) -> None:
+    global _shared_reporter, _shared_refs
+
+    with _shared_lock:
+        _shared_refs = max(0, _shared_refs - 1)
+
+        if _shared_refs == 0 and _shared_reporter is not None:
+            reporter = _shared_reporter
+            _shared_reporter = None
+            reporter.stop(send_final=True)

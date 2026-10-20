@@ -102,6 +102,61 @@ def resolve_bot_install_paths(bot: BotRegistryItem) -> tuple[Path, Path]:
     return BOTS_DIR / folder_name, VENVS_DIR / folder_name
 
 
+def needs_install(bot: BotRegistryItem) -> bool:
+    """
+    Decide se o bot precisa ser (re)preparado.
+
+    Bot com auto_update ligado NÃO valida versão/commit esperados: ele sempre
+    acompanha a branch (git pull forçado antes de cada execução), então só
+    importa se já existe instalação local íntegra.
+    """
+    if not bot.local_path or not bot.venv_path:
+        return True
+
+    expected_bot_dir, expected_venv_dir = resolve_bot_install_paths(bot)
+
+    if Path(bot.local_path) != expected_bot_dir:
+        return True
+
+    if Path(bot.venv_path) != expected_venv_dir:
+        return True
+
+    if not expected_bot_dir.exists() or not _venv_python(expected_venv_dir).exists():
+        return True
+
+    if bot.last_install_status in ("error", "not_installed", "outdated"):
+        return True
+
+    if bot.auto_update:
+        return False
+
+    if bot.installed_version != bot.expected_version:
+        return True
+
+    if bot.expected_commit and bot.installed_commit != bot.expected_commit:
+        return True
+
+    return False
+
+
+def install_retry_allowed(bot: BotRegistryItem, now) -> bool:
+    """False enquanto o bot estiver no intervalo de espera após falha de instalação."""
+    return not (bot.next_install_retry_at and now < bot.next_install_retry_at)
+
+
+def register_install_failure(bot: BotRegistryItem, now) -> None:
+    from datetime import timedelta
+
+    bot.install_failures = (bot.install_failures or 0) + 1
+    minutes = min(5 * (2 ** (bot.install_failures - 1)), 120)
+    bot.next_install_retry_at = now + timedelta(minutes=minutes)
+
+
+def register_install_success(bot: BotRegistryItem) -> None:
+    bot.install_failures = 0
+    bot.next_install_retry_at = None
+
+
 def _notify(progress_callback: ProgressCallback | None, message: str) -> None:
     if progress_callback:
         progress_callback(message)
@@ -216,7 +271,8 @@ def _checkout_expected_revision(
     progress_callback: ProgressCallback | None = None,
     bot_label: str = "bot",
 ) -> None:
-    expected_commit = (bot.expected_commit or "").strip()
+    # auto_update acompanha a branch; ignora o commit/versão esperados.
+    expected_commit = "" if bot.auto_update else (bot.expected_commit or "").strip()
     branch = (bot.branch or "").strip()
 
     if expected_commit:
@@ -261,7 +317,7 @@ def _checkout_expected_revision(
 
         _notify(progress_callback, f"Limpando arquivos locais do bot {bot_label}.")
         _run_command(
-            ["git", "clean", "-ffdx"],
+            ["git", "clean", "-fd"],
             cwd=bot_dir,
             error_prefix=f"Falha ao limpar arquivos locais da branch {branch}",
         )
@@ -280,18 +336,11 @@ def _checkout_expected_revision(
         error_prefix=f"Falha ao resetar branch {default_branch}",
     )
     _run_command(
-        ["git", "clean", "-ffdx"],
+        ["git", "clean", "-fd"],
         cwd=bot_dir,
         error_prefix=f"Falha ao limpar arquivos locais da branch {default_branch}",
     )
     return
-
-    _notify(progress_callback, f"Atualizando repositorio do bot {bot_label}.")
-    _run_command(
-        ["git", "status", "--short"],
-        cwd=bot_dir,
-        error_prefix="Falha ao atualizar repositório",
-    )
 
 
 def _force_clean_worktree(
@@ -309,7 +358,7 @@ def _force_clean_worktree(
 
     _notify(progress_callback, f"Removendo alteracoes e arquivos locais do bot {bot_label}.")
     _run_command(
-        ["git", "clean", "-ffdx"],
+        ["git", "clean", "-fd"],
         cwd=bot_dir,
         error_prefix="Falha ao limpar arquivos locais do repositorio",
     )
@@ -417,6 +466,8 @@ def _ensure_venv(
 ) -> Path:
     venv_python = _venv_python(venv_dir)
 
+    created = False
+
     if not venv_python.exists():
         venv_dir.parent.mkdir(parents=True, exist_ok=True)
         _notify(progress_callback, f"Criando venv do bot {bot_label}.")
@@ -425,16 +476,22 @@ def _ensure_venv(
             cwd=None,
             error_prefix=f"Falha ao criar venv do bot em {venv_dir}",
         )
+        created = True
 
     if not venv_python.exists():
         raise BotInstallError(f"Venv criada, mas python não encontrado em {venv_python}")
 
-    _notify(progress_callback, f"Atualizando pip da venv do bot {bot_label}.")
-    _run_command(
-        [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"],
-        cwd=None,
-        error_prefix="Falha ao atualizar pip da venv",
-    )
+    if created:
+        # Só atualiza o pip na criação da venv; nas demais vezes evita rede à toa.
+        _notify(progress_callback, f"Atualizando pip da venv do bot {bot_label}.")
+        try:
+            _run_command(
+                [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"],
+                cwd=None,
+                error_prefix="Falha ao atualizar pip da venv",
+            )
+        except BotInstallError as exc:
+            _notify(progress_callback, f"Aviso: {exc}")
 
     return venv_python
 

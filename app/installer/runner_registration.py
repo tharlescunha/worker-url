@@ -74,8 +74,16 @@ def _resolve_desktop_dir() -> Path:
 
 
 def create_worker_bat() -> str:
+    """
+    Copia o iniciar_worker.bat do repositório do runtime para C:\OrkaFlow.
+
+    O .bat do repositório faz atualização forçada via git e reinicia o worker
+    sozinho; manter uma única fonte evita que a máquina fique com um .bat
+    desatualizado em relação ao código.
+    """
     runtime_dir = get_worker_runtime_dir()
     python_exe = get_worker_runtime_venv_dir() / "Scripts" / "python.exe"
+    template = runtime_dir / "iniciar_worker.bat"
 
     if not runtime_dir.exists():
         raise RuntimeError(f"Pasta do runtime não encontrada: {runtime_dir}")
@@ -83,30 +91,11 @@ def create_worker_bat() -> str:
     if not python_exe.exists():
         raise RuntimeError(f"Python do runtime não encontrado: {python_exe}")
 
+    if not template.exists():
+        raise RuntimeError(f"iniciar_worker.bat não encontrado no runtime: {template}")
+
     WORKER_BAT_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    content = f"""@echo off
-title OrkaFlow Worker
-cd /d "{runtime_dir}"
-
-echo ========================================
-echo          ORKAFLOW WORKER
-echo ========================================
-echo.
-echo Worker iniciado.
-echo Deixe esta janela aberta.
-echo.
-echo Pressione CTRL+C para parar.
-echo.
-
-"{python_exe}" -m app.runtime.main
-
-echo.
-echo Worker finalizado.
-pause
-"""
-
-    WORKER_BAT_FILE.write_text(content, encoding="utf-8")
+    WORKER_BAT_FILE.write_bytes(template.read_bytes())
     return str(WORKER_BAT_FILE)
 
 

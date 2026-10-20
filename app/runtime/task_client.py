@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Callable
 
 from app.core.constants import LOGS_DIR, RUNTIME_EVENT_PATH
+from app.core.exceptions import ForbiddenError
 from app.core.http_client import HttpClient
 
 
@@ -59,7 +60,8 @@ class TaskApiClient:
                 return operation()
             except Exception as exc:
                 last_exc = exc
-                if attempt >= attempts:
+                # 403 é recusa explícita do backend: repetir não adianta.
+                if attempt >= attempts or isinstance(exc, ForbiddenError):
                     break
 
                 time.sleep(delay)

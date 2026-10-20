@@ -18,6 +18,8 @@ class AuthData(BaseModel):
 
 
 class RunnerConfigData(BaseModel):
+    # Máximo de tasks BACKGROUND simultâneas (foreground é sempre 1 por vez
+    # e roda junto com as de background). Teto aplicado em constants.
     max_concurrency: int = Field(default=1, ge=1)
     polling_interval: int = Field(default=10, ge=1)
 
@@ -84,6 +86,10 @@ class BotRegistryItem(BaseModel):
 
     execution_mode: str = "background"
     auto_update: bool = False
+
+    # Backoff de instalação: evita reinstalar a cada ciclo um bot que falha sempre.
+    install_failures: int = 0
+    next_install_retry_at: datetime | None = None
 
 
 class BotsRegistry(BaseModel):
