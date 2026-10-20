@@ -1,9 +1,11 @@
+import os
 from pathlib import Path
 
 APP_NAME = "OrkaFlow Worker"
 WORKER_VERSION = "0.3.0"
 
-BASE_DIR = Path(r"C:\OrkaFlow")
+# ORKAFLOW_BASE_DIR existe só para testes; em produção é sempre C:\OrkaFlow.
+BASE_DIR = Path(os.environ.get("ORKAFLOW_BASE_DIR") or r"C:\OrkaFlow")
 
 APP_DIR = BASE_DIR / "app"
 BOTS_DIR = BASE_DIR / "bots"

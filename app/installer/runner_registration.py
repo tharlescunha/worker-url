@@ -45,6 +45,7 @@ class InstallerInput:
     runner_name: str
     runner_label: str
     access_remote: bool = False
+    run_as_admin: bool = True
 
 
 def _notify(progress_callback: Callable[[str], None] | None, message: str) -> None:
@@ -75,7 +76,7 @@ def _resolve_desktop_dir() -> Path:
 
 def create_worker_bat() -> str:
     """
-    Copia o iniciar_worker.bat do repositório do runtime para C:\OrkaFlow.
+    Copia o iniciar_worker.bat do repositório do runtime para a pasta base do worker.
 
     O .bat do repositório faz atualização forçada via git e reinicia o worker
     sozinho; manter uma única fonte evita que a máquina fique com um .bat
@@ -99,7 +100,18 @@ def create_worker_bat() -> str:
     return str(WORKER_BAT_FILE)
 
 
-def create_desktop_shortcut() -> str:
+def _set_run_as_admin(shortcut: Path) -> None:
+    """Marca o atalho (.lnk) para "Executar como administrador" (bit 0x20 do byte 0x15)."""
+    data = bytearray(shortcut.read_bytes())
+
+    if len(data) < 0x16 or data[:4] != b"L\x00\x00\x00":
+        raise RuntimeError(f"Arquivo de atalho inválido: {shortcut}")
+
+    data[0x15] |= 0x20
+    shortcut.write_bytes(bytes(data))
+
+
+def create_desktop_shortcut(run_as_admin: bool = False) -> str:
     desktop = _resolve_desktop_dir()
     shortcut = desktop / "OrkaFlow Worker.lnk"
 
@@ -139,6 +151,9 @@ $Shortcut.Save()
 
     if not shortcut.exists():
         raise RuntimeError(f"Atalho não foi criado: {shortcut}")
+
+    if run_as_admin:
+        _set_run_as_admin(shortcut)
 
     return str(shortcut)
 
@@ -271,7 +286,7 @@ def run_registration_flow(
     worker_bat = create_worker_bat()
 
     _notify(progress_callback, "Criando atalho na área de trabalho...")
-    desktop_shortcut = create_desktop_shortcut()
+    desktop_shortcut = create_desktop_shortcut(run_as_admin=installer_input.run_as_admin)
 
     _notify(progress_callback, "Finalizado.")
 

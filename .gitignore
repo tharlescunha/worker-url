@@ -29,3 +29,5 @@ htmlcov/
 # Sistema
 .DS_Store
 Thumbs.db
+# cache do pip criado por testes
+pip/
