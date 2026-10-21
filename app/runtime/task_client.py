@@ -20,6 +20,7 @@ ERROR_TASK_PATH = "/api/v1/worker/tasks/{task_id}/errors"
 TELEMETRY_TASK_PATH = "/api/v1/worker/tasks/{task_id}/telemetry"
 HEARTBEAT_PATH = "/api/v1/worker/heartbeat/"
 RESOLVE_CREDENTIAL_PATH = "/api/v1/worker/credentials/{credential_id}/resolve"
+TASK_ENV_PATH = "/api/v1/worker/tasks/{task_id}/env"
 SCREENSHOT_PATH = "/api/v1/worker/screenshot/"
 AUTO_VERSION_PATH = "/api/v1/worker/bot-versions/auto"
 
@@ -332,6 +333,17 @@ class TaskApiClient:
         payload["running_tasks"] = running_tasks
 
         return self.client.post(HEARTBEAT_PATH, payload)
+
+    def resolve_task_env(self, task_id: int) -> dict:
+        """Variáveis de ambiente finais da task: {variables: {...}, secret_names: [...]}."""
+        return self._with_retry(
+            lambda: self.client.post(
+                TASK_ENV_PATH.format(task_id=task_id),
+                self._auth_payload(),
+            ),
+            operation_name="resolve_task_env",
+            task_id=task_id,
+        )
 
     def resolve_credential(
         self,

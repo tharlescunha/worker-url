@@ -202,6 +202,18 @@ def execute_task(
         )
 
         env = os.environ.copy()
+
+        task_env, secret_masker, secret_count = _load_task_environment(api, task_id, logger)
+        env.update(task_env)
+        if task_env:
+            _send_worker_task_log(
+                api,
+                task_id,
+                logger,
+                f"Variáveis de ambiente entregues ao robô: {len(task_env)} ({secret_count} secretas).",
+            )
+            env["ORKAFLOW_ENV_NAMES"] = ",".join(sorted(task_env))
+
         env["ORKAFLOW_TASK_FILE"] = str(task_file)
         env["ORKAFLOW_RESULT_FILE"] = str(result_file)
         env["ORKAFLOW_TASK_ID"] = str(task_id)
@@ -258,6 +270,7 @@ def execute_task(
             process=process,
             timeout_seconds=timeout_seconds,
             inactivity_timeout_seconds=_resolve_inactivity_timeout(task_data),
+            masker=secret_masker,
             logger=logger,
             task_id=task_id,
             api=api,
@@ -789,6 +802,60 @@ def _resolve_bot_for_task(task_data: dict) -> BotRegistryItem:
         f"Bot não encontrado no registry local para task_id={task_data.get('task_id')} "
         f"bot_id={task_bot_id} bot_version_id={task_bot_version_id}"
     )
+
+
+ENV_RESERVED_PREFIX = "ORKAFLOW_"
+ENV_RESERVED_NAMES = {
+    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TEMP", "TMP",
+    "USERPROFILE", "USERNAME", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "COMPUTERNAME",
+    "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV",
+}
+MIN_SECRET_LENGTH_TO_MASK = 4
+
+
+class SecretMasker:
+    """Troca valores de variáveis secretas por *** em qualquer texto (logs do robô)."""
+
+    def __init__(self, secrets: list[str]) -> None:
+        # mais longos primeiro, para um segredo que contém outro ser mascarado inteiro
+        self._secrets = sorted(
+            {s for s in secrets if s and len(s) >= MIN_SECRET_LENGTH_TO_MASK},
+            key=len,
+            reverse=True,
+        )
+
+    def mask(self, text: str) -> str:
+        for secret in self._secrets:
+            if secret in text:
+                text = text.replace(secret, "***")
+        return text
+
+
+def _load_task_environment(api: TaskApiClient, task_id: int, logger) -> tuple[dict[str, str], SecretMasker, int]:
+    """
+    Busca as variáveis de ambiente da task no backend. Devolve (variáveis, mascarador de
+    segredos, quantidade de secretas). Backend antigo sem o endpoint (404) = sem variáveis;
+    qualquer outra falha derruba a task com mensagem clara (não roda o robô sem a config).
+    """
+    try:
+        response = api.resolve_task_env(task_id)
+    except Exception as exc:
+        if "HTTP 404" in str(exc):
+            logger.warning("Backend sem endpoint de variáveis de ambiente (404); seguindo sem elas.")
+            return {}, SecretMasker([]), 0
+        raise RuntimeError(f"Não foi possível obter as variáveis de ambiente da task: {exc}") from exc
+
+    raw = response.get("variables") or {}
+    secret_names = set(response.get("secret_names") or [])
+
+    variables = {
+        str(name): "" if value is None else str(value)
+        for name, value in raw.items()
+        if str(name).upper() not in ENV_RESERVED_NAMES
+        and not str(name).upper().startswith(ENV_RESERVED_PREFIX)
+    }
+    masker = SecretMasker([variables[name] for name in variables if name in secret_names])
+    return variables, masker, len([n for n in variables if n in secret_names])
 
 
 def _warn_if_foreground_session_unavailable(
@@ -1577,6 +1644,7 @@ def _consume_process_output_live(
     process: subprocess.Popen,
     timeout_seconds: int,
     inactivity_timeout_seconds: int = DEFAULT_INACTIVITY_TIMEOUT_SECONDS,
+    masker: SecretMasker | None = None,
     logger,
     task_id: int,
     api: TaskApiClient,
@@ -1636,6 +1704,8 @@ def _consume_process_output_live(
 
             last_output_at = time.time()
             line = _shorten_text(line, 4000)
+            if masker is not None:
+                line = masker.mask(line)
 
             if stream_name == "stdout":
                 _append_capped(stdout_lines, line, MAX_CAPTURED_OUTPUT_LINES)
@@ -1666,6 +1736,8 @@ def _consume_process_output_live(
                 break
 
             line = _shorten_text(line, 4000)
+            if masker is not None:
+                line = masker.mask(line)
 
             if stream_name == "stdout":
                 _append_capped(stdout_lines, line, MAX_CAPTURED_OUTPUT_LINES)

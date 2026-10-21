@@ -490,5 +490,82 @@ class BotRegistryOnDemandTests(unittest.TestCase):
             self.assertNotIn("Bot não encontrado", message)
 
 
+class TaskEnvironmentTests(unittest.TestCase):
+    class _Api:
+        def __init__(self, response=None, error=None):
+            self.response, self.error = response, error
+
+        def resolve_task_env(self, task_id):
+            if self.error:
+                raise self.error
+            return self.response
+
+        def check_task_status(self, task_id):
+            return {}
+
+        def send_log(self, **kwargs):
+            return {}
+
+    def test_secret_masker_hides_values_and_ignores_too_short_ones(self):
+        from app.runtime.task_executor import SecretMasker
+
+        masker = SecretMasker(["abc12345", "xy", ""])
+        self.assertEqual(masker.mask("senha=abc12345 fim"), "senha=*** fim")
+        self.assertEqual(masker.mask("xy continua"), "xy continua", "valor curto demais não é mascarado")
+
+    def test_variables_are_loaded_reserved_names_are_dropped_and_secrets_masked(self):
+        from app.runtime.task_executor import _load_task_environment
+
+        api = self._Api({
+            "variables": {"SAP_URL": "https://sap", "SAP_SENHA": "s3gredo!", "PATH": "x", "ORKAFLOW_TASK_ID": "9"},
+            "secret_names": ["SAP_SENHA"],
+        })
+
+        variables, masker, secrets = _load_task_environment(api, 1, logging.getLogger("t"))
+
+        self.assertEqual(variables, {"SAP_URL": "https://sap", "SAP_SENHA": "s3gredo!"})
+        self.assertEqual(secrets, 1)
+        self.assertEqual(masker.mask("login s3gredo! ok"), "login *** ok")
+
+    def test_old_backend_without_endpoint_means_no_variables(self):
+        from app.core.exceptions import ApiRequestError
+        from app.runtime.task_executor import _load_task_environment
+
+        variables, _masker, secrets = _load_task_environment(
+            self._Api(error=ApiRequestError("HTTP 404: Not Found")), 1, logging.getLogger("t")
+        )
+        self.assertEqual((variables, secrets), ({}, 0))
+
+    def test_other_failures_stop_the_task_instead_of_running_without_config(self):
+        from app.core.exceptions import ApiRequestError
+        from app.runtime.task_executor import _load_task_environment
+
+        with self.assertRaises(RuntimeError) as ctx:
+            _load_task_environment(self._Api(error=ApiRequestError("HTTP 500: erro")), 1, logging.getLogger("t"))
+        self.assertIn("variáveis de ambiente", str(ctx.exception))
+
+    def test_secret_printed_by_the_robot_is_masked_in_captured_output(self):
+        import subprocess as sp
+
+        from app.runtime import task_executor as te
+
+        code = "import os; print('minha senha e', os.environ['SAP_SENHA'], flush=True)"
+        env = dict(os.environ, SAP_SENHA="s3gredo!")
+        process = sp.Popen(
+            [sys.executable, "-u", "-c", code], stdout=sp.PIPE, stderr=sp.PIPE, text=True, encoding="utf-8", env=env
+        )
+        stdout, _ = te._consume_process_output_live(
+            process=process,
+            timeout_seconds=30,
+            masker=te.SecretMasker(["s3gredo!"]),
+            logger=logging.getLogger("t"),
+            task_id=1,
+            api=self._Api(),
+        )
+
+        self.assertIn("minha senha e ***", stdout)
+        self.assertNotIn("s3gredo", stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
