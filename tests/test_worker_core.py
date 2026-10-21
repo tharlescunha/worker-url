@@ -420,6 +420,38 @@ class BotRegistryOnDemandTests(unittest.TestCase):
             self.assertEqual([b.bot_id for b in registry.bots], ["5"])
             self.assertFalse(registry.bots[0].local_path)
 
+    def test_background_sync_does_not_install_bots_never_used_on_this_machine(self):
+        import app.sync.bot_sync as bs
+        from app.core.config_models import BotsRegistry
+        from app.sync.bot_installer import InstallResult
+
+        with TemporaryDirectory() as tmp:
+            registry_file = self._registry_in(tmp)
+            # bot 2 já existe nesta máquina (tem local_path), bot 1 nunca foi instalado aqui
+            bs.save_registry(BotsRegistry(bots=[
+                BotRegistryItem(bot_id="2", name="Bot Dois", local_path=str(Path(tmp) / "b2"),
+                                venv_path=str(Path(tmp) / "v2")),
+            ]))
+
+            installed = []
+
+            def fake_install(bot, progress_callback=None):
+                installed.append(bot.bot_id)
+                return InstallResult(local_path=str(Path(tmp) / "x"), venv_path=str(Path(tmp) / "y"),
+                                     installed_commit="abc", requirements_hash=None, message="ok")
+
+            original = bs.install_or_update_bot
+            bs.install_or_update_bot = fake_install
+            self.addCleanup(lambda: setattr(bs, "install_or_update_bot", original))
+
+            client = self._FakeClient(bots=[
+                {"bot_id": 1, "name": "Bot Um", "repository_url": "https://x/1.git", "version": "1"},
+                {"bot_id": 2, "name": "Bot Dois", "repository_url": "https://x/2.git", "version": "2"},
+            ])
+            bs.sync_bots(client, _runner(1), install_missing=False)
+
+            self.assertEqual(installed, ["2"], "só o bot que já existe na máquina é atualizado")
+
     def test_task_with_unknown_bot_syncs_and_retries_instead_of_failing(self):
         import app.runtime.task_executor as te
         import app.sync.bot_sync as bs

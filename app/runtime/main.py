@@ -166,6 +166,7 @@ class BotSyncThread(threading.Thread):
                 self.runner,
                 progress_callback=lambda message: self.log_buffer.add(message),
                 failure_callback=self._on_bot_failure,
+                install_missing=False,
             )
             save_model(RUNNER_FILE, self.runner)
             self.logger.info(
@@ -391,13 +392,6 @@ def _start_available_tasks(
                 exc,
             )
             return
-
-        flush_worker_logs_to_task(
-            task_api=task_api,
-            logger=logger,
-            task_id=task_id,
-            log_buffer=log_buffer,
-        )
 
         started = manager.start_task(next_task)
 

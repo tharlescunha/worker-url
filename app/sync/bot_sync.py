@@ -52,15 +52,20 @@ def sync_bots(
     progress_callback: ProgressCallback | None = None,
     failure_callback: FailureCallback | None = None,
     install: bool = True,
+    install_missing: bool = True,
 ) -> dict:
     """
     Sincroniza os bots vinculados ao runner com o registry local.
 
-    Com install=False só atualiza os dados (rápido, uma chamada à API): a task que
-    precisar de um bot ainda não instalado prepara apenas aquele bot.
+    - install=False: só atualiza os dados (rápido, uma chamada à API); a task que precisar
+      de um bot ainda não instalado prepara apenas aquele bot.
+    - install_missing=False: instala/atualiza só bots que JÁ existem nesta máquina; bots
+      nunca usados aqui ficam para a primeira task que precisar deles.
     """
     with SYNC_LOCK:
-        return _sync_bots_locked(client, runner_data, progress_callback, failure_callback, install)
+        return _sync_bots_locked(
+            client, runner_data, progress_callback, failure_callback, install, install_missing
+        )
 
 
 def _sync_bots_locked(
@@ -69,6 +74,7 @@ def _sync_bots_locked(
     progress_callback: ProgressCallback | None,
     failure_callback: FailureCallback | None,
     install: bool,
+    install_missing: bool = True,
 ) -> dict:
     payload = {
         "uuid": runner_data.uuid,
@@ -123,7 +129,7 @@ def _sync_bots_locked(
         current.last_sync_at = datetime.now(timezone.utc)
 
         if needs_install(current):
-            if not install:
+            if not install or (not install_missing and not current.local_path):
                 # Só registra os dados do bot; a instalação fica para depois (ou para a task).
                 updated_items.append(current)
                 continue
