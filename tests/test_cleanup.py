@@ -1,4 +1,4 @@
-"""Limpeza de processos que sobram depois de falha (SAP etc.)."""
+"""Limpeza de processos que sobram depois de falha (SAP, CIGAM, Citrix...)."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from app.runtime import cleanup
 LOGGER = logging.getLogger("test-cleanup")
 
 
-class RulesTests(unittest.TestCase):
+class _RulesFileCase(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -27,41 +27,65 @@ class RulesTests(unittest.TestCase):
         cleanup.CLEANUP_RULES_FILE = Path(self._tmp.name) / "cleanup_rules.json"
         self.addCleanup(lambda: setattr(cleanup, "CLEANUP_RULES_FILE", self._original))
 
-    def test_default_file_is_created_and_sap_rule_matches_output(self):
-        rules = cleanup.load_rules(LOGGER)
+
+class RulesTests(_RulesFileCase):
+    def test_defaults_cover_sap_cigam_and_citrix_with_wildcards(self):
+        rules = {rule.name: rule for rule in cleanup.load_rules(LOGGER)}
+
         self.assertTrue(cleanup.CLEANUP_RULES_FILE.exists())
+        self.assertEqual(rules["SAP"].processes, ["sap*"])
+        self.assertEqual(rules["CIGAM"].processes, ["cigam*"])
+        self.assertIn("citrix*", rules["Citrix"].processes)
+        self.assertTrue(all(rule.before_foreground and rule.on_foreground_failure for rule in rules.values()))
 
-        sap = next(rule for rule in rules if rule.name == "SAP")
-        self.assertTrue(sap.matches("BOT_ETL_Estoque_PO", "RuntimeError: Falha no login SAP: senha incorreta"))
-        self.assertFalse(sap.matches("BOT_ETL_Estoque_PO", "erro qualquer de banco de dados"))
+    def test_any_foreground_failure_triggers_cleanup_but_background_needs_a_match(self):
+        sap = next(rule for rule in cleanup.load_rules(LOGGER) if rule.name == "SAP")
 
-    def test_rule_without_processes_never_matches(self):
-        sigam = next(rule for rule in cleanup.load_rules(LOGGER) if rule.name == "SIGAM")
-        self.assertFalse(sigam.matches("BOT", "Falha no SIGAM"))
+        self.assertTrue(sap.matches_failure("BOT_X", "erro qualquer", is_foreground=True))
+        self.assertFalse(sap.matches_failure("BOT_X", "erro qualquer", is_foreground=False))
+        self.assertTrue(sap.matches_failure("BOT_X", "Falha no login SAP", is_foreground=False))
 
     def test_match_by_bot_name_and_disabled_rule(self):
-        cleanup.CLEANUP_RULES_FILE.write_text(json.dumps({"rules": [
+        cleanup.CLEANUP_RULES_FILE.write_text(json.dumps({"version": cleanup.RULES_VERSION, "rules": [
             {"name": "X", "enabled": True, "match_bot_names": ["estoque"], "processes": ["a.exe"]},
-            {"name": "Y", "enabled": False, "match_output_regex": "erro", "processes": ["b.exe"]},
+            {"name": "Y", "enabled": False, "on_foreground_failure": True, "processes": ["b.exe"]},
+            {"name": "Z", "enabled": True, "on_foreground_failure": True, "processes": []},
         ]}), encoding="utf-8")
 
-        x, y = cleanup.load_rules(LOGGER)
-        self.assertTrue(x.matches("BOT_ETL_Estoque_PO", ""))
-        self.assertFalse(y.matches("qualquer", "erro"))
+        x, y, z = cleanup.load_rules(LOGGER)
+        self.assertTrue(x.matches_failure("BOT_ETL_Estoque_PO", "", False))
+        self.assertFalse(y.matches_failure("qualquer", "", True))
+        self.assertFalse(z.matches_failure("qualquer", "", True), "regra sem processos não faz nada")
 
     def test_invalid_file_falls_back_to_defaults(self):
         cleanup.CLEANUP_RULES_FILE.write_text("{ isto não é json", encoding="utf-8")
-        names = [rule.name for rule in cleanup.load_rules(LOGGER)]
-        self.assertIn("SAP", names)
+        self.assertIn("SAP", [rule.name for rule in cleanup.load_rules(LOGGER)])
+
+    def test_old_version_is_backed_up_and_replaced_with_new_defaults(self):
+        cleanup.CLEANUP_RULES_FILE.write_text(json.dumps({"rules": [
+            {"name": "SAP", "processes": ["saplogon.exe"]},
+        ]}), encoding="utf-8")
+
+        rules = {rule.name: rule for rule in cleanup.load_rules(LOGGER)}
+
+        self.assertEqual(rules["SAP"].processes, ["sap*"])
+        backup = cleanup.CLEANUP_RULES_FILE.with_suffix(".json.bak")
+        self.assertTrue(backup.exists())
+        self.assertIn("saplogon.exe", backup.read_text(encoding="utf-8"))
+
+    def test_user_edits_on_current_version_are_kept(self):
+        cleanup.load_rules(LOGGER)
+        data = json.loads(cleanup.CLEANUP_RULES_FILE.read_text(encoding="utf-8"))
+        data["rules"][0]["processes"] = ["meusap.exe"]
+        cleanup.CLEANUP_RULES_FILE.write_text(json.dumps(data), encoding="utf-8")
+
+        rules = cleanup.load_rules(LOGGER)
+        self.assertEqual(rules[0].processes, ["meusap.exe"])
 
 
-class KillTests(unittest.TestCase):
+class KillTests(_RulesFileCase):
     def setUp(self):
-        self._tmp = TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self._original = cleanup.CLEANUP_RULES_FILE
-        cleanup.CLEANUP_RULES_FILE = Path(self._tmp.name) / "cleanup_rules.json"
-        self.addCleanup(lambda: setattr(cleanup, "CLEANUP_RULES_FILE", self._original))
+        super().setUp()
 
         # processo "falso" com nome próprio: cópia do ping.exe que fica rodando
         self.fake = Path(self._tmp.name) / "fakesaptest.exe"
@@ -71,6 +95,7 @@ class KillTests(unittest.TestCase):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
         def _stop_fake():
             if self.proc.poll() is None:
                 self.proc.kill()
@@ -79,40 +104,51 @@ class KillTests(unittest.TestCase):
         self.addCleanup(_stop_fake)
         time.sleep(0.5)
 
-        cleanup.CLEANUP_RULES_FILE.write_text(json.dumps({"rules": [
-            {"name": "FAKE", "enabled": True, "match_output_regex": r"\bSAP\b",
-             "processes": ["fakesaptest.exe"], "before_foreground": True},
+        cleanup.CLEANUP_RULES_FILE.write_text(json.dumps({"version": cleanup.RULES_VERSION, "rules": [
+            {"name": "FAKE", "enabled": True, "processes": ["fakesap*"],
+             "before_foreground": True, "on_foreground_failure": True,
+             "match_output_regex": r"\bSAP\b"},
         ]}), encoding="utf-8")
 
-    def test_failure_with_sap_in_output_kills_leftover_process(self):
+    def test_foreground_failure_kills_by_wildcard(self):
         self.assertIsNone(self.proc.poll(), "o processo falso precisa estar rodando")
 
         messages = cleanup.cleanup_after_failure(
-            task_id=1, bot_name="BOT", output_text="Falha no login SAP", logger=LOGGER
+            task_id=1, bot_name="BOT", output_text="", logger=LOGGER, is_foreground=True
         )
 
-        self.assertTrue(messages and "fakesaptest.exe" in messages[0])
+        self.assertTrue(messages and "fakesap*" in messages[0])
         self.proc.wait(timeout=10)
         self.assertIsNotNone(self.proc.poll())
 
-    def test_failure_unrelated_to_sap_leaves_process_alone(self):
+    def test_background_failure_without_match_leaves_process_alone(self):
         messages = cleanup.cleanup_after_failure(
-            task_id=1, bot_name="BOT", output_text="erro de planilha", logger=LOGGER
+            task_id=1, bot_name="BOT", output_text="erro de planilha", logger=LOGGER, is_foreground=False
         )
         self.assertEqual(messages, [])
         self.assertIsNone(self.proc.poll())
+
+    def test_background_failure_mentioning_sap_kills_it(self):
+        messages = cleanup.cleanup_after_failure(
+            task_id=1, bot_name="BOT", output_text="Falha no login SAP", logger=LOGGER, is_foreground=False
+        )
+        self.assertTrue(messages)
+        self.proc.wait(timeout=10)
 
     def test_does_not_kill_while_another_foreground_task_runs(self):
         cleanup.mark_foreground_started(500)
         self.addCleanup(lambda: cleanup.mark_foreground_finished(500))
 
-        messages = cleanup.cleanup_after_failure(
-            task_id=1, bot_name="BOT", output_text="Falha no login SAP", logger=LOGGER
+        self.assertEqual(
+            cleanup.cleanup_after_failure(
+                task_id=1, bot_name="BOT", output_text="Falha SAP", logger=LOGGER, is_foreground=True
+            ),
+            [],
         )
-        self.assertEqual(messages, [])
-        self.assertIsNone(self.proc.poll(), "não pode derrubar o SAP de outra task com foco")
+        self.assertEqual(cleanup.cleanup_before_foreground(task_id=1, logger=LOGGER), [])
+        self.assertIsNone(self.proc.poll(), "não pode derrubar a tela de outra task com foco")
 
-    def test_cleanup_before_foreground_only_for_flagged_rules(self):
+    def test_cleanup_before_foreground_kills_leftovers(self):
         messages = cleanup.cleanup_before_foreground(task_id=2, logger=LOGGER)
         self.assertTrue(messages)
         self.proc.wait(timeout=10)

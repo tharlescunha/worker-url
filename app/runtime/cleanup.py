@@ -1,25 +1,30 @@
 """
-Limpeza de processos que sobram depois de uma task com falha.
+Limpeza de processos que sobram de uma task com foco (SAP, CIGAM, Citrix...).
 
-Programas como o SAP abrem janelas/processos que NÃO são filhos do robô; se o robô
-falha, eles ficam abertos (tela de login, popup de erro) e atrapalham a próxima task.
+Esses programas abrem janelas/processos que NÃO são filhos do robô; se o robô falha ou
+é encerrado, eles ficam abertos (tela de login, popup de erro) e atrapalham a próxima
+task. Como só uma task com foco roda por vez, é seguro encerrá-los entre uma task e outra.
 
 As regras ficam em CONFIG_DIR/cleanup_rules.json (fora do git, então atualizações do
-worker não sobrescrevem). O arquivo é criado com valores padrão na primeira vez.
+worker não sobrescrevem). O arquivo é criado com os valores padrão na primeira vez.
 Cada regra tem:
   - name: nome da regra (aparece no log da task)
   - enabled: liga/desliga
-  - match_output_regex: expressão (sem diferenciar maiúsculas) procurada na saída do robô
-  - match_bot_names: trechos do nome do bot que também disparam a regra
-  - processes: nomes dos executáveis a encerrar (ex.: "saplogon.exe")
-  - before_foreground: se true, também encerra esses processos ANTES de iniciar uma task
-    com foco (garante tela limpa; só roda se nenhuma outra task com foco estiver ativa)
+  - processes: executáveis a encerrar; aceita curinga (ex.: "sap*" encerra saplogon.exe,
+    sapgui.exe...). Veja os nomes com `tasklist`.
+  - before_foreground: encerra esses processos ANTES de iniciar uma task com foco
+  - on_foreground_failure: encerra depois de QUALQUER falha de task com foco
+  - match_output_regex: também encerra depois de falha (de qualquer task) se a saída do robô
+    casar com a expressão (sem diferenciar maiúsculas)
+  - match_bot_names: idem, se o nome do bot contiver um destes trechos
+Nunca encerra nada enquanto outra task com foco estiver em andamento.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import threading
 from dataclasses import dataclass, field
@@ -28,32 +33,48 @@ from app.core.constants import CONFIG_DIR
 
 CLEANUP_RULES_FILE = CONFIG_DIR / "cleanup_rules.json"
 
+# Sobe quando os padrões mudam: arquivos mais antigos são salvos como .bak e recriados.
+RULES_VERSION = 2
+
 DEFAULT_RULES: list[dict] = [
     {
         "name": "SAP",
         "enabled": True,
+        "processes": ["sap*"],
+        "before_foreground": True,
+        "on_foreground_failure": True,
         "match_output_regex": r"\bSAP\b",
         "match_bot_names": [],
-        "processes": ["saplogon.exe", "sapgui.exe", "NWBC.exe", "SAPBusinessClient.exe"],
-        "before_foreground": False,
     },
     {
-        "name": "SIGAM",
+        "name": "CIGAM",
         "enabled": True,
-        "match_output_regex": r"\bSIGAM\b",
+        "processes": ["cigam*"],
+        "before_foreground": True,
+        "on_foreground_failure": True,
+        "match_output_regex": r"\bCIGAM\b",
         "match_bot_names": [],
-        "processes": [],
-        "before_foreground": False,
+    },
+    {
+        "name": "Citrix",
+        "enabled": True,
+        "processes": ["citrix*", "wfica32.exe"],
+        "before_foreground": True,
+        "on_foreground_failure": True,
+        "match_output_regex": r"\bCitrix\b",
+        "match_bot_names": [],
     },
 ]
 
 _HELP = (
-    "Edite este arquivo para ajustar a limpeza depois de falhas. 'processes' é a lista de "
-    "executáveis a encerrar (veja os nomes no Gerenciador de Tarefas ou com 'tasklist'). "
-    "'match_bot_names' dispara a regra pelo nome do bot, mesmo sem aparecer o texto na saída."
+    "Edite este arquivo para ajustar a limpeza de processos entre tasks. 'processes' aceita "
+    "curinga (sap*). before_foreground limpa antes de cada task com foco; on_foreground_failure "
+    "limpa depois de qualquer falha de task com foco; match_output_regex/match_bot_names limpam "
+    "depois de falha quando a saída ou o nome do bot casam. Nada é encerrado enquanto outra "
+    "task com foco estiver rodando."
 )
 
-# Tasks com foco em andamento nesta máquina: a limpeza nunca derruba o SAP de outra task.
+# Tasks com foco em andamento nesta máquina: a limpeza nunca derruba a tela de outra task.
 _foreground_lock = threading.Lock()
 _running_foreground: set[int] = set()
 
@@ -77,14 +98,18 @@ def other_foreground_running(task_id: int) -> bool:
 class CleanupRule:
     name: str
     enabled: bool = True
-    match_output_regex: str = ""
-    match_bot_names: list[str] = field(default_factory=list)
     processes: list[str] = field(default_factory=list)
     before_foreground: bool = False
+    on_foreground_failure: bool = False
+    match_output_regex: str = ""
+    match_bot_names: list[str] = field(default_factory=list)
 
-    def matches(self, bot_name: str, output_text: str) -> bool:
+    def matches_failure(self, bot_name: str, output_text: str, is_foreground: bool) -> bool:
         if not self.enabled or not self.processes:
             return False
+
+        if is_foreground and self.on_foreground_failure:
+            return True
 
         name = (bot_name or "").lower()
         if any(part.strip() and part.strip().lower() in name for part in self.match_bot_names):
@@ -99,15 +124,38 @@ class CleanupRule:
         return False
 
 
+def _write_default_file() -> None:
+    CLEANUP_RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CLEANUP_RULES_FILE.write_text(
+        json.dumps(
+            {"_ajuda": _HELP, "version": RULES_VERSION, "rules": DEFAULT_RULES},
+            indent=4,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
 def load_rules(logger=None) -> list[CleanupRule]:
-    """Lê as regras; cria o arquivo padrão se não existir. Nunca levanta exceção."""
+    """Lê as regras; cria o arquivo padrão (ou migra um antigo). Nunca levanta exceção."""
+    items: list = DEFAULT_RULES
+
     try:
         if not CLEANUP_RULES_FILE.exists():
-            CLEANUP_RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
-            CLEANUP_RULES_FILE.write_text(
-                json.dumps({"_ajuda": _HELP, "rules": DEFAULT_RULES}, indent=4, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            _write_default_file()
+        else:
+            raw = json.loads(CLEANUP_RULES_FILE.read_text(encoding="utf-8"))
+            version = raw.get("version", 0) if isinstance(raw, dict) else 0
+
+            if version < RULES_VERSION:
+                shutil.copy(CLEANUP_RULES_FILE, CLEANUP_RULES_FILE.with_suffix(".json.bak"))
+                _write_default_file()
+                if logger:
+                    logger.warning(
+                        "cleanup_rules.json atualizado para a versão %s (cópia da anterior em .bak).",
+                        RULES_VERSION,
+                    )
+
         raw = json.loads(CLEANUP_RULES_FILE.read_text(encoding="utf-8"))
         items = raw.get("rules", []) if isinstance(raw, dict) else raw
     except Exception as exc:
@@ -123,17 +171,18 @@ def load_rules(logger=None) -> list[CleanupRule]:
             CleanupRule(
                 name=str(item.get("name") or "regra"),
                 enabled=bool(item.get("enabled", True)),
-                match_output_regex=str(item.get("match_output_regex") or ""),
-                match_bot_names=[str(v) for v in (item.get("match_bot_names") or [])],
                 processes=[str(v) for v in (item.get("processes") or []) if str(v).strip()],
                 before_foreground=bool(item.get("before_foreground", False)),
+                on_foreground_failure=bool(item.get("on_foreground_failure", False)),
+                match_output_regex=str(item.get("match_output_regex") or ""),
+                match_bot_names=[str(v) for v in (item.get("match_bot_names") or [])],
             )
         )
     return rules
 
 
 def kill_image(image_name: str) -> bool:
-    """Encerra todos os processos com esse nome (e filhos). True se matou algum."""
+    """Encerra os processos com esse nome (aceita curinga) e seus filhos. True se matou algum."""
     result = subprocess.run(
         ["taskkill", "/F", "/T", "/IM", image_name],
         capture_output=True,
@@ -161,25 +210,22 @@ def cleanup_after_failure(
     bot_name: str,
     output_text: str,
     logger,
+    is_foreground: bool = False,
 ) -> list[str]:
-    """
-    Depois de uma task com falha, encerra os processos das regras que casam com a saída
-    ou com o nome do bot. Não faz nada se outra task com foco estiver rodando.
-    Devolve mensagens descrevendo o que foi encerrado.
-    """
+    """Depois de uma task com falha, encerra os processos das regras que se aplicam."""
     if other_foreground_running(task_id):
         return []
 
     messages: list[str] = []
 
     for rule in load_rules(logger):
-        if not rule.matches(bot_name, output_text):
+        if not rule.matches_failure(bot_name, output_text, is_foreground):
             continue
 
         killed = _kill_rule_processes(rule, logger)
         if killed:
             message = (
-                f"Limpeza após falha (regra {rule.name}): processos encerrados: {', '.join(killed)}."
+                f"Limpeza após falha (regra {rule.name}): encerrado(s) {', '.join(killed)}."
             )
             logger.warning("%s | task_id=%s", message, task_id)
             messages.append(message)
@@ -200,7 +246,7 @@ def cleanup_before_foreground(*, task_id: int, logger) -> list[str]:
 
         killed = _kill_rule_processes(rule, logger)
         if killed:
-            message = f"Limpeza antes da task (regra {rule.name}): processos encerrados: {', '.join(killed)}."
+            message = f"Limpeza antes da task (regra {rule.name}): encerrado(s) {', '.join(killed)}."
             logger.warning("%s | task_id=%s", message, task_id)
             messages.append(message)
 

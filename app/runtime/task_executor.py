@@ -342,6 +342,7 @@ def execute_task(
             logger=logger,
             bot_name=bot_name_for_cleanup,
             output_text="\n".join(filter(None, [stderr_text, stdout_text])),
+            is_foreground=execution_mode == EXECUTION_MODE_FOREGROUND,
         )
 
     except TaskStopRequested as exc:
@@ -479,6 +480,7 @@ def execute_task(
             logger=logger,
             bot_name=bot_name_for_cleanup,
             output_text="",
+            is_foreground=execution_mode == EXECUTION_MODE_FOREGROUND,
         )
 
     except Exception as exc:
@@ -977,7 +979,15 @@ def _ensure_bot_ready(
     return target
 
 
-def _cleanup_after_failure(*, api: TaskApiClient, task_id: int, logger, bot_name: str, output_text: str) -> None:
+def _cleanup_after_failure(
+    *,
+    api: TaskApiClient,
+    task_id: int,
+    logger,
+    bot_name: str,
+    output_text: str,
+    is_foreground: bool,
+) -> None:
     """Encerra processos que sobraram (SAP etc.) depois de uma falha; nunca levanta exceção."""
     try:
         messages = process_cleanup.cleanup_after_failure(
@@ -985,6 +995,7 @@ def _cleanup_after_failure(*, api: TaskApiClient, task_id: int, logger, bot_name
             bot_name=bot_name,
             output_text=output_text,
             logger=logger,
+            is_foreground=is_foreground,
         )
         for message in messages:
             _send_worker_task_log(api, task_id, logger, message, level=LOG_LEVEL_WARNING)
