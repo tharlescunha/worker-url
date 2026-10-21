@@ -26,6 +26,7 @@ from app.core.constants import (
 )
 from app.core.http_client import HttpClient
 from app.core.json_store import load_model, save_model
+from app.runtime import cleanup as process_cleanup
 from app.runtime.bot_usage import REGISTRY_LOCK, bot_usage
 from app.runtime.events import EventReporter
 from app.runtime.screenshot_reporter import acquire_screenshots, release_screenshots
@@ -123,6 +124,10 @@ def execute_task(
     bot_running = None
 
     execution_started_at = datetime.now(UTC)
+    bot_name_for_cleanup = ""
+
+    if execution_mode == EXECUTION_MODE_FOREGROUND:
+        process_cleanup.mark_foreground_started(task_id)
 
     try:
         try:
@@ -220,6 +225,12 @@ def execute_task(
         )
 
         print(f"Executando task {task_id} | modo={execution_mode}")
+
+        bot_name_for_cleanup = bot.name or str(bot.bot_id)
+
+        if execution_mode == EXECUTION_MODE_FOREGROUND:
+            for message in process_cleanup.cleanup_before_foreground(task_id=task_id, logger=logger):
+                _send_worker_task_log(api, task_id, logger, message, level=LOG_LEVEL_WARNING)
 
         net_before = psutil.net_io_counters()
 
@@ -324,6 +335,14 @@ def execute_task(
 
         logger.error("Task finalizada com erro | task_id=%s returncode=%s", task_id, process.returncode)
         print(f"Task finalizada com erro | task_id={task_id} | exit_code={process.returncode}")
+
+        _cleanup_after_failure(
+            api=api,
+            task_id=task_id,
+            logger=logger,
+            bot_name=bot_name_for_cleanup,
+            output_text="\n".join(filter(None, [stderr_text, stdout_text])),
+        )
 
     except TaskStopRequested as exc:
         stop_message = "Task interrompida por solicitacao remota."
@@ -454,6 +473,14 @@ def execute_task(
         logger.error("Task finalizada por timeout | task_id=%s", task_id)
         print(f"Task finalizada por timeout | task_id={task_id}")
 
+        _cleanup_after_failure(
+            api=api,
+            task_id=task_id,
+            logger=logger,
+            bot_name=bot_name_for_cleanup,
+            output_text="",
+        )
+
     except Exception as exc:
         message = f"Erro ao executar task: {exc}"
         stacktrace = traceback.format_exc()
@@ -524,6 +551,9 @@ def execute_task(
         print(f"Task finalizada com erro | task_id={task_id}")
 
     finally:
+        if execution_mode == EXECUTION_MODE_FOREGROUND:
+            process_cleanup.mark_foreground_finished(task_id)
+
         if screenshots_acquired:
             try:
                 release_screenshots(logger)
@@ -945,6 +975,21 @@ def _ensure_bot_ready(
             _save_bot_in_registry(target)
 
     return target
+
+
+def _cleanup_after_failure(*, api: TaskApiClient, task_id: int, logger, bot_name: str, output_text: str) -> None:
+    """Encerra processos que sobraram (SAP etc.) depois de uma falha; nunca levanta exceção."""
+    try:
+        messages = process_cleanup.cleanup_after_failure(
+            task_id=task_id,
+            bot_name=bot_name,
+            output_text=output_text,
+            logger=logger,
+        )
+        for message in messages:
+            _send_worker_task_log(api, task_id, logger, message, level=LOG_LEVEL_WARNING)
+    except Exception:
+        logger.exception("Falha na limpeza de processos após erro | task_id=%s", task_id)
 
 
 def _save_bot_in_registry(bot: BotRegistryItem) -> None:
