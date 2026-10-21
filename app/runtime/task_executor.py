@@ -31,6 +31,7 @@ from app.runtime.events import EventReporter
 from app.runtime.screenshot_reporter import acquire_screenshots, release_screenshots
 from app.runtime.services import describe_session, is_input_desktop_available
 from app.runtime.task_client import TaskApiClient
+from app.sync.bot_sync import sync_bots
 from app.sync.bot_installer import (
     git_pull_for_auto_update,
     install_or_update_bot,
@@ -67,6 +68,10 @@ STDERR_ERROR_MARKERS = (
     "fatal",
     "critical",
 )
+
+
+class BotNotInRegistryError(RuntimeError):
+    """O bot da task ainda não consta no registry local desta máquina."""
 
 
 class TaskInactivityTimeout(subprocess.TimeoutExpired):
@@ -120,7 +125,20 @@ def execute_task(
     execution_started_at = datetime.now(UTC)
 
     try:
-        bot = _resolve_bot_for_task(task_data)
+        try:
+            bot = _resolve_bot_for_task(task_data)
+        except BotNotInRegistryError:
+            # Máquina nova ou bot recém-vinculado: busca os dados dos bots agora (rápido,
+            # sem instalar tudo) e tenta de novo. A instalação é só a do bot desta task.
+            _send_worker_task_log(
+                api,
+                task_id,
+                logger,
+                "Bot ainda não está nesta máquina; sincronizando a lista de bots com o backend...",
+            )
+            sync_bots(client, runner, install=False)
+            bot = _resolve_bot_for_task(task_data)
+
         _warn_if_foreground_session_unavailable(
             execution_mode=execution_mode,
             api=api,
@@ -719,7 +737,8 @@ def _resolve_bot_for_task(task_data: dict) -> BotRegistryItem:
     registry = load_model(BOTS_REGISTRY_FILE, BotsRegistry)
 
     if not registry:
-        raise RuntimeError("bots_registry.json não encontrado.")
+        # Arquivo ainda não existe (máquina nova): a sincronização sob demanda o cria.
+        raise BotNotInRegistryError("bots_registry.json não encontrado.")
 
     task_bot_id = task_data.get("bot_id")
     task_bot_version_id = task_data.get("bot_version_id")
@@ -734,7 +753,7 @@ def _resolve_bot_for_task(task_data: dict) -> BotRegistryItem:
             if bot.bot_version_id == task_bot_version_id:
                 return bot
 
-    raise RuntimeError(
+    raise BotNotInRegistryError(
         f"Bot não encontrado no registry local para task_id={task_data.get('task_id')} "
         f"bot_id={task_bot_id} bot_version_id={task_bot_version_id}"
     )

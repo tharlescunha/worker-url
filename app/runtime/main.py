@@ -259,6 +259,24 @@ def main() -> int:
 
     recover_runner_startup_tasks(task_api, runner, logger)
 
+    # Antes de pegar qualquer task, carrega a lista de bots vinculados (rápido, não instala).
+    # Assim uma máquina recém-configurada já sabe quais bots existem; cada task prepara só o seu.
+    try:
+        summary = sync_bots(client, runner, install=False)
+        save_model(RUNNER_FILE, runner)
+        logger.warning(
+            "Lista de bots carregada | total=%s vinculados=%s",
+            summary.get("total"),
+            summary.get("linked"),
+        )
+    except Exception as exc:
+        logger.exception("Falha ao carregar a lista de bots na partida: %s", exc)
+        events.report(
+            RUNTIME_EVENT_TYPE_SYNC_FAILED,
+            f"Falha ao carregar a lista de bots na partida: {exc}",
+            reason="initial_sync_failed",
+        )
+
     events.report(
         RUNTIME_EVENT_TYPE_WORKER_STARTED,
         f"Worker iniciado (versão {WORKER_VERSION}) | {describe_session()}",

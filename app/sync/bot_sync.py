@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -18,6 +19,9 @@ from app.sync.bot_installer import (
 
 
 SYNC_PATH = "/api/v1/worker/sync"
+
+# Só um sync por vez (thread periódica e sync sob demanda de uma task não se atropelam).
+SYNC_LOCK = threading.RLock()
 ProgressCallback = Callable[[str], None]
 FailureCallback = Callable[[BotRegistryItem, str], None]
 
@@ -47,6 +51,24 @@ def sync_bots(
     runner_data,
     progress_callback: ProgressCallback | None = None,
     failure_callback: FailureCallback | None = None,
+    install: bool = True,
+) -> dict:
+    """
+    Sincroniza os bots vinculados ao runner com o registry local.
+
+    Com install=False só atualiza os dados (rápido, uma chamada à API): a task que
+    precisar de um bot ainda não instalado prepara apenas aquele bot.
+    """
+    with SYNC_LOCK:
+        return _sync_bots_locked(client, runner_data, progress_callback, failure_callback, install)
+
+
+def _sync_bots_locked(
+    client: HttpClient,
+    runner_data,
+    progress_callback: ProgressCallback | None,
+    failure_callback: FailureCallback | None,
+    install: bool,
 ) -> dict:
     payload = {
         "uuid": runner_data.uuid,
@@ -101,6 +123,11 @@ def sync_bots(
         current.last_sync_at = datetime.now(timezone.utc)
 
         if needs_install(current):
+            if not install:
+                # Só registra os dados do bot; a instalação fica para depois (ou para a task).
+                updated_items.append(current)
+                continue
+
             now = datetime.now(timezone.utc)
 
             if not install_retry_allowed(current, now):

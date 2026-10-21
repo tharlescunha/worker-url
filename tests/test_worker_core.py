@@ -371,5 +371,92 @@ class InactivityTimeoutTests(unittest.TestCase):
         self.assertEqual(_resolve_inactivity_timeout({"inactivity_timeout_seconds": 120}), 120)
 
 
+class BotRegistryOnDemandTests(unittest.TestCase):
+    """Máquina recém-configurada: o bot da task ainda não está no registry local."""
+
+    class _FakeClient:
+        def __init__(self, bots=None):
+            self.bots = bots or []
+            self.posts = []
+
+        def post(self, path, payload=None, **kwargs):
+            self.posts.append((path, payload))
+            if path.endswith("/worker/sync"):
+                return {"bots": self.bots, "polling_interval": 10, "max_concurrency": 2}
+            return {}
+
+        patch = post
+
+    def _registry_in(self, tmp):
+        import app.runtime.task_executor as te
+        import app.sync.bot_sync as bs
+
+        registry_file = Path(tmp) / "bots_registry.json"
+        originals = (bs.BOTS_REGISTRY_FILE, te.BOTS_REGISTRY_FILE)
+        bs.BOTS_REGISTRY_FILE = registry_file
+        te.BOTS_REGISTRY_FILE = registry_file
+        self.addCleanup(lambda: (setattr(bs, "BOTS_REGISTRY_FILE", originals[0]),
+                                 setattr(te, "BOTS_REGISTRY_FILE", originals[1])))
+        return registry_file
+
+    def test_sync_without_install_only_registers_bots(self):
+        import app.sync.bot_sync as bs
+
+        with TemporaryDirectory() as tmp:
+            self._registry_in(tmp)
+            installs = []
+            original_install = bs.install_or_update_bot
+            bs.install_or_update_bot = lambda *a, **k: installs.append(1)
+            self.addCleanup(lambda: setattr(bs, "install_or_update_bot", original_install))
+
+            client = self._FakeClient(bots=[
+                {"bot_id": 5, "name": "Bot Cinco", "repository_url": "https://x/y.git", "version": "1"},
+            ])
+            summary = bs.sync_bots(client, _runner(1), install=False)
+
+            self.assertEqual(installs, [], "install=False não pode instalar nada")
+            self.assertEqual(summary["linked"], 1)
+            registry = bs.load_registry()
+            self.assertEqual([b.bot_id for b in registry.bots], ["5"])
+            self.assertFalse(registry.bots[0].local_path)
+
+    def test_task_with_unknown_bot_syncs_and_retries_instead_of_failing(self):
+        import app.runtime.task_executor as te
+        import app.sync.bot_sync as bs
+
+        with TemporaryDirectory() as tmp:
+            self._registry_in(tmp)
+            client = self._FakeClient(bots=[
+                {"bot_id": 5, "name": "Bot Cinco", "repository_url": "https://x/y.git", "version": "1"},
+            ])
+
+            class Stop(RuntimeError):
+                pass
+
+            original_ready = te._ensure_bot_ready
+
+            def fake_ready(bot, **kwargs):
+                raise Stop("chegou na preparação do bot")
+
+            te._ensure_bot_ready = fake_ready
+            self.addCleanup(lambda: setattr(te, "_ensure_bot_ready", original_ready))
+
+            te.execute_task(
+                client=client,
+                runner=_runner(1),
+                task_data={"task_id": 99, "bot_id": 5, "execution_mode": "background"},
+                logger=logging.getLogger("test"),
+            )
+
+            sync_calls = [p for p, _ in client.posts if p.endswith("/worker/sync")]
+            self.assertEqual(len(sync_calls), 1, "deve sincronizar uma vez sob demanda")
+
+            finish = [payload for path, payload in client.posts if path.endswith("/finish")]
+            self.assertTrue(finish, "a task deve ser finalizada")
+            message = finish[-1]["final_message"]
+            self.assertIn("chegou na preparação do bot", message)
+            self.assertNotIn("Bot não encontrado", message)
+
+
 if __name__ == "__main__":
     unittest.main()
