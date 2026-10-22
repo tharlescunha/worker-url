@@ -11,6 +11,7 @@ from typing import Callable
 from app.core.config_models import BotRegistryItem
 from app.core.constants import BOTS_DIR, VENVS_DIR
 from app.core.exceptions import BotInstallError
+from app.core.log_masking import mask_url_credentials
 
 
 ProgressCallback = Callable[[str], None]
@@ -541,6 +542,8 @@ def _run_command(
     error_prefix: str,
     timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess:
+    # A mensagem de erro vai para log, task e painel: nunca com o token da URL de clone.
+    error_prefix = mask_url_credentials(error_prefix)
     try:
         result = subprocess.run(
             command,
@@ -556,12 +559,12 @@ def _run_command(
             f"{error_prefix}: comando excedeu {timeout_seconds}s e foi encerrado."
         ) from exc
     except Exception as exc:
-        raise BotInstallError(f"{error_prefix}: {exc}") from exc
+        raise BotInstallError(f"{error_prefix}: {mask_url_credentials(str(exc))}") from exc
 
     if result.returncode != 0:
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
         detail = stderr or stdout or "sem detalhes"
-        raise BotInstallError(f"{error_prefix}: {detail}")
+        raise BotInstallError(f"{error_prefix}: {mask_url_credentials(detail)}")
 
     return result

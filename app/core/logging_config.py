@@ -11,6 +11,7 @@ from app.core.constants import (
     TMP_DIR,
     TMP_RETENTION_DAYS,
 )
+from app.core.log_masking import UrlCredentialsFilter
 
 
 def cleanup_old_files() -> None:
@@ -84,6 +85,11 @@ def setup_logging() -> logging.Logger:
     )
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
+
+    # Nada de usuário/token de URL (ex.: clone do Azure DevOps) no arquivo, na tela ou no painel.
+    masking = UrlCredentialsFilter()
+    console_handler.addFilter(masking)
+    file_handler.addFilter(masking)
 
     logger.addHandler(console_handler)
     logger.addHandler(file_handler)

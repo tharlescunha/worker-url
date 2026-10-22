@@ -19,10 +19,12 @@ from app.core.constants import (
 from app.core.exceptions import AuthenticationError, ForbiddenError
 from app.core.http_client import HttpClient
 from app.core.json_store import load_model, save_model
+from app.core.log_masking import UrlCredentialsFilter
 from app.core.logging_config import setup_logging
 from app.core.security import unprotect_text
 from app.runtime.auth_refresh import TokenRefresher
 from app.runtime.events import EventReporter
+from app.runtime.log_shipper import LogShipperThread, RemoteLogHandler
 from app.runtime.services import (
     HeartbeatThread,
     LoopProgress,
@@ -235,6 +237,19 @@ def main() -> int:
     )
     events = EventReporter(task_api, logger)
     log_buffer = WorkerLogBuffer(logger)
+
+    # Tela de Logs do painel: o mesmo conteúdo do worker.log sobe em lotes.
+    remote_log_handler = RemoteLogHandler()
+    remote_log_handler.addFilter(UrlCredentialsFilter())
+    logger.addHandler(remote_log_handler)
+    log_shipper = LogShipperThread(
+        remote_log_handler,
+        base_url=auth.base_url,
+        runner_uuid=runner.uuid,
+        runner_token=runner.runner_token,
+        logger=logger,
+    )
+    log_shipper.start()
     progress = LoopProgress()
 
     manager = TaskExecutionManager(
@@ -341,6 +356,8 @@ def main() -> int:
         heartbeat.stop()
         pulse.stop()
         bot_sync.stop()
+        log_shipper.stop()
+        logger.removeHandler(remote_log_handler)
 
 
 def _start_available_tasks(
