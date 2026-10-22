@@ -1,0 +1,3 @@
+# .bat precisa de CRLF no Windows (rótulos e "call :x" falham com LF),
+# independente do core.autocrlf de cada máquina.
+*.bat text eol=crlf

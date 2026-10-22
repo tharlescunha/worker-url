@@ -15,9 +15,13 @@ rem =====================================================================
 
 rem O git reset pode reescrever este arquivo enquanto o loop roda, e o cmd
 rem le o .bat durante a execucao. Por isso roda uma copia temporaria.
+rem A copia e feita com "type" (arquivo novo, data de agora). "copy" manteria a
+rem data do original, e a limpeza de sobras abaixo apagaria a propria copia em uso.
+rem Este bloco inteiro e lido de uma vez pelo cmd, entao o original pode ser
+rem atualizado (ver :refresh_launcher) enquanto a copia roda.
 if /i not "%~1"=="--child" (
     set "ORKA_COPY=%TEMP%\orkaflow_launcher_%RANDOM%%RANDOM%.bat"
-    copy /y "%~f0" "!ORKA_COPY!" >nul
+    type "%~f0" > "!ORKA_COPY!"
     call "!ORKA_COPY!" --child
     set "ORKA_EXIT=!errorlevel!"
     del "!ORKA_COPY!" >nul 2>&1
@@ -68,6 +72,7 @@ if not exist "%PY%" (
 cd /d "%RUNTIME_REPO%"
 
 call :update_code
+call :refresh_launcher
 call :install_requirements
 
 "%PY%" -m app.runtime.supervisor
@@ -103,6 +108,21 @@ if errorlevel 1 (
 git clean -fd >>"%LAUNCHER_LOG%" 2>&1
 
 for /f %%i in ('git rev-parse --short HEAD') do call :log "Codigo atualizado. Versao %%i"
+exit /b 0
+
+
+:refresh_launcher
+rem O C:\OrkaFlow\iniciar_worker.bat (o do atalho) e copiado so na configuracao
+rem da maquina. Mantem ele igual ao do repositorio para correcoes chegarem sozinhas.
+if not exist "%RUNTIME_REPO%\iniciar_worker.bat" exit /b 0
+fc /b "%RUNTIME_REPO%\iniciar_worker.bat" "%BASE%\iniciar_worker.bat" >nul 2>&1
+if not errorlevel 1 exit /b 0
+copy /y "%RUNTIME_REPO%\iniciar_worker.bat" "%BASE%\iniciar_worker.bat" >nul 2>&1
+if errorlevel 1 (
+    call :log "AVISO: nao foi possivel atualizar %BASE%\iniciar_worker.bat."
+) else (
+    call :log "Launcher atualizado em %BASE%\iniciar_worker.bat."
+)
 exit /b 0
 
 
