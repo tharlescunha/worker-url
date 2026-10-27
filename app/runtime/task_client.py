@@ -17,6 +17,7 @@ STATUS_TASK_PATH = "/api/v1/worker/tasks/{task_id}/status"
 FINISH_TASK_PATH = "/api/v1/worker/tasks/{task_id}/finish"
 LOG_TASK_PATH = "/api/v1/worker/tasks/{task_id}/logs"
 ERROR_TASK_PATH = "/api/v1/worker/tasks/{task_id}/errors"
+CREDENTIAL_ALERT_TASK_PATH = "/api/v1/worker/tasks/{task_id}/credential-alert"
 TELEMETRY_TASK_PATH = "/api/v1/worker/tasks/{task_id}/telemetry"
 HEARTBEAT_PATH = "/api/v1/worker/heartbeat/"
 RESOLVE_CREDENTIAL_PATH = "/api/v1/worker/credentials/{credential_id}/resolve"
@@ -259,6 +260,37 @@ class TaskApiClient:
             task_id=task_id,
         )
 
+    def send_credential_alert(
+        self,
+        task_id: int,
+        *,
+        credential_id: int | None,
+        chave: str | None,
+        motivo: str,
+        mensagem: str,
+        sistema: str | None = None,
+    ) -> dict:
+        """
+        Avisa o backend que o robô não conseguiu usar a credencial (senha incorreta,
+        expirada, usuário bloqueado...). credential_id pode ir vazio: o backend tenta
+        descobrir pela task.
+        """
+        payload = self._auth_payload()
+        payload["credential_id"] = credential_id
+        payload["chave"] = chave
+        payload["motivo"] = motivo
+        payload["mensagem"] = mensagem
+        payload["sistema"] = sistema
+
+        return self._with_retry(
+            lambda: self.client.post(
+                CREDENTIAL_ALERT_TASK_PATH.format(task_id=task_id),
+                payload,
+            ),
+            operation_name="send_credential_alert",
+            task_id=task_id,
+        )
+
     def send_telemetry(
         self,
         task_id: int,
@@ -349,9 +381,17 @@ class TaskApiClient:
         self,
         credential_id: int,
         keys: list[str] | None = None,
+        task_id: int | None = None,
     ) -> dict:
+        """
+        Valores de uma credencial. task_id vai junto para o backend conferir que a
+        credencial pertence ao repositório da automação daquela task.
+        """
         payload = self._auth_payload()
         payload["keys"] = keys or []
+
+        if task_id is not None:
+            payload["task_id"] = int(task_id)
 
         return self.client.post(
             RESOLVE_CREDENTIAL_PATH.format(credential_id=credential_id),

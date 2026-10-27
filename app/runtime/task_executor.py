@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 import traceback
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 import queue
@@ -59,6 +60,15 @@ STOP_STATUS_CHECK_INTERVAL_SECONDS = 5
 RESULT_JSON_MAX_BYTES = 1024 * 1024
 MAX_CAPTURED_OUTPUT_LINES = 1000
 
+# Robô avisa que a credencial não serviu: linha no stdout começando com o marcador,
+# seguida de um JSON {"sistema","chave","motivo","mensagem"}. Código de saída 3
+# significa o mesmo, mesmo sem a linha.
+CREDENTIAL_ALERT_MARKER = "ORKAFLOW_ALERTA_CREDENCIAL"
+CREDENTIAL_ALERT_EXIT_CODE = 3
+CREDENTIAL_ALERT_MOTIVOS = {"senha_incorreta", "senha_expirada", "usuario_bloqueado"}
+CREDENTIAL_ALERT_MOTIVO_DEFAULT = "invalida"
+CREDENTIAL_ALERT_MESSAGE_MAX_LEN = 300
+
 STDERR_ERROR_MARKERS = (
     "traceback",
     "exception",
@@ -69,6 +79,33 @@ STDERR_ERROR_MARKERS = (
     "fatal",
     "critical",
 )
+
+
+@dataclass
+class CredentialResolution:
+    """
+    O que o worker buscou de credencial para a task atual: qual foi (id e chaves) e os
+    valores, só para mascarar nos logs do robô. Uma instância por task; nunca sai do processo.
+    """
+
+    credential_id: int | None = None
+    keys: list[str] = field(default_factory=list)
+    secrets: list[str] = field(default_factory=list)
+
+    def register(self, credential_id: int, keys: list[str], values: dict) -> None:
+        self.credential_id = int(credential_id)
+        self.keys = [str(key) for key in keys]
+        self.secrets.extend(
+            str(value)
+            for value in values.values()
+            if value is not None and len(str(value)) >= MIN_SECRET_LENGTH_TO_MASK
+        )
+
+    def as_dict(self) -> dict | None:
+        """{"credential_id", "keys"} ou None quando a task não usou credencial."""
+        if self.credential_id is None:
+            return None
+        return {"credential_id": self.credential_id, "keys": list(self.keys)}
 
 
 class BotNotInRegistryError(RuntimeError):
@@ -174,10 +211,12 @@ def execute_task(
         if not entrypoint.exists():
             raise RuntimeError(f"Entrypoint do bot não encontrado: {entrypoint}")
 
+        credential_resolution = CredentialResolution()
         prepared_task_data = _prepare_task_data_for_execution(
             task_data=task_data,
             api=api,
             logger=logger,
+            resolution=credential_resolution,
         )
 
         task_file = _write_task_payload_file(
@@ -204,6 +243,8 @@ def execute_task(
         env = os.environ.copy()
 
         task_env, secret_masker, secret_count = _load_task_environment(api, task_id, logger)
+        # Valores da credencial também somem dos logs do robô.
+        secret_masker = secret_masker.with_extra(credential_resolution.secrets)
         env.update(task_env)
         if task_env:
             _send_worker_task_log(
@@ -266,6 +307,7 @@ def execute_task(
         if process.stdout is None or process.stderr is None:
             raise RuntimeError("stdout/stderr do processo não foram inicializados.")
 
+        credential_alert_lines: list[str] = []
         stdout_text, stderr_text = _consume_process_output_live(
             process=process,
             timeout_seconds=timeout_seconds,
@@ -274,6 +316,7 @@ def execute_task(
             logger=logger,
             task_id=task_id,
             api=api,
+            credential_alert_lines=credential_alert_lines,
         )
 
         telemetry = telemetry_collector.stop(
@@ -296,6 +339,18 @@ def execute_task(
         except Exception:
             logger.exception("Falha ao enviar telemetria da task | task_id=%s", task_id)
 
+        credential_alert = _build_credential_alert(
+            exit_code=process.returncode,
+            marker_line=credential_alert_lines[-1] if credential_alert_lines else None,
+            credential=credential_resolution.as_dict(),
+        )
+        if credential_alert is not None:
+            # A mensagem pode carregar a linha crua do robô: mascara antes de sair da máquina.
+            credential_alert["mensagem"] = secret_masker.mask(credential_alert["mensagem"])
+            # Antes do finish: o backend marca a credencial e avisa os responsáveis.
+            # Falha aqui não pode travar o encerramento normal da task.
+            _send_credential_alert_safely(api, task_id, credential_alert, logger)
+
         if process.returncode == 0:
             result_json = _read_task_result_json(
                 result_file=result_file,
@@ -317,12 +372,16 @@ def execute_task(
             return
 
         error_message = f"Bot finalizou com código de saída {process.returncode}."
+        error_type = "bot_exit_code"
+        if credential_alert is not None and process.returncode == CREDENTIAL_ALERT_EXIT_CODE:
+            error_message = f"Credencial inválida: {credential_alert['mensagem']} {error_message}"
+            error_type = "credential_invalid"
         trace_text = _build_stacktrace(stderr_text, stdout_text)
 
         try:
             api.send_error(
                 task_id=task_id,
-                error_type="bot_exit_code",
+                error_type=error_type,
                 message=error_message,
                 stacktrace=trace_text,
                 code=str(process.returncode),
@@ -830,6 +889,14 @@ class SecretMasker:
                 text = text.replace(secret, "***")
         return text
 
+    @property
+    def secrets(self) -> list[str]:
+        return list(self._secrets)
+
+    def with_extra(self, secrets: list[str]) -> "SecretMasker":
+        """Novo mascarador com os segredos atuais mais estes (ex.: valores de credencial)."""
+        return SecretMasker(self._secrets + list(secrets))
+
 
 def _load_task_environment(api: TaskApiClient, task_id: int, logger) -> tuple[dict[str, str], SecretMasker, int]:
     """
@@ -1089,6 +1156,7 @@ def _prepare_task_data_for_execution(
     task_data: dict,
     api: TaskApiClient,
     logger,
+    resolution: CredentialResolution | None = None,
 ) -> dict:
     prepared = dict(task_data)
     original_parameters = task_data.get("parameters") or []
@@ -1101,6 +1169,8 @@ def _prepare_task_data_for_execution(
                 param=param,
                 api=api,
                 logger=logger,
+                task_id=_safe_int(task_data.get("task_id")),
+                resolution=resolution,
             )
         )
 
@@ -1110,10 +1180,19 @@ def _prepare_task_data_for_execution(
     return prepared
 
 
+def _safe_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _resolve_parameter_for_execution(
     param: dict,
     api: TaskApiClient,
     logger,
+    task_id: int | None = None,
+    resolution: CredentialResolution | None = None,
 ) -> dict:
     if not isinstance(param, dict):
         return param
@@ -1151,6 +1230,7 @@ def _resolve_parameter_for_execution(
         response = api.resolve_credential(
             credential_id=int(credential_id),
             keys=requested_keys,
+            task_id=task_id,
         )
     except Exception as exc:
         logger.exception(
@@ -1175,6 +1255,9 @@ def _resolve_parameter_for_execution(
     for key_name, original_value in itens.items():
         final_dados_acesso[key_name] = resolved_dados_acesso.get(key_name, original_value)
 
+    if resolution is not None:
+        resolution.register(int(credential_id), requested_keys, resolved_dados_acesso)
+
     parsed_value["dados_acesso"] = final_dados_acesso
 
     updated_param = dict(param)
@@ -1184,6 +1267,112 @@ def _resolve_parameter_for_execution(
     )
 
     return updated_param
+
+
+def _parse_credential_alert_line(line: str | None) -> dict | None:
+    """
+    Lê a linha "ORKAFLOW_ALERTA_CREDENCIAL {json}" do robô. Devolve {sistema, chave, motivo,
+    mensagem} sempre que a linha começa com o marcador (JSON ruim ou ausente = campos
+    vazios, motivo "invalida"); None se não é uma linha de alerta.
+    """
+    if not line:
+        return None
+
+    stripped = line.strip()
+    if not stripped.startswith(CREDENTIAL_ALERT_MARKER):
+        return None
+
+    payload: dict = {}
+    raw_json = stripped[len(CREDENTIAL_ALERT_MARKER):].strip()
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            payload = parsed
+
+    def _text(name: str) -> str | None:
+        value = payload.get(name)
+        if value is None:
+            return None
+        value = str(value).strip()
+        return value or None
+
+    motivo = _text("motivo")
+    if motivo not in CREDENTIAL_ALERT_MOTIVOS:
+        motivo = CREDENTIAL_ALERT_MOTIVO_DEFAULT
+
+    mensagem = _text("mensagem") or _shorten_text(stripped, CREDENTIAL_ALERT_MESSAGE_MAX_LEN)
+
+    return {
+        "sistema": _text("sistema"),
+        "chave": _text("chave"),
+        "motivo": motivo,
+        "mensagem": _shorten_text(mensagem, CREDENTIAL_ALERT_MESSAGE_MAX_LEN),
+    }
+
+
+def _build_credential_alert(
+    *,
+    exit_code: int | None,
+    marker_line: str | None,
+    credential: dict | None,
+) -> dict | None:
+    """
+    Alerta de credencial a enviar ao backend, ou None quando o robô não sinalizou nada
+    (nem linha com marcador, nem código de saída 3). credential é o que foi resolvido
+    para a task ({"credential_id", "keys"}) ou None.
+    """
+    parsed = _parse_credential_alert_line(marker_line)
+
+    if parsed is None and exit_code != CREDENTIAL_ALERT_EXIT_CODE:
+        return None
+
+    if parsed is None:
+        parsed = {
+            "sistema": None,
+            "chave": None,
+            "motivo": CREDENTIAL_ALERT_MOTIVO_DEFAULT,
+            "mensagem": f"Bot encerrou com código de saída {CREDENTIAL_ALERT_EXIT_CODE}.",
+        }
+
+    credential_id = credential.get("credential_id") if isinstance(credential, dict) else None
+
+    return {
+        "credential_id": credential_id,
+        "chave": parsed["chave"],
+        "motivo": parsed["motivo"],
+        "mensagem": parsed["mensagem"],
+        "sistema": parsed["sistema"],
+    }
+
+
+def _send_credential_alert_safely(api: TaskApiClient, task_id: int, alert: dict, logger) -> None:
+    """Envia o alerta; qualquer falha vira só um warning, o fluxo da task segue."""
+    try:
+        api.send_credential_alert(
+            task_id,
+            credential_id=alert.get("credential_id"),
+            chave=alert.get("chave"),
+            motivo=alert.get("motivo") or CREDENTIAL_ALERT_MOTIVO_DEFAULT,
+            mensagem=alert.get("mensagem") or "",
+            sistema=alert.get("sistema"),
+        )
+        logger.warning(
+            "Alerta de credencial enviado | task_id=%s credential_id=%s chave=%s motivo=%s",
+            task_id,
+            alert.get("credential_id"),
+            alert.get("chave"),
+            alert.get("motivo"),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Falha ao enviar alerta de credencial | task_id=%s credential_id=%s erro=%s",
+            task_id,
+            alert.get("credential_id"),
+            exc,
+        )
 
 
 def _build_result_file_path(task_id: int) -> Path:
@@ -1648,7 +1837,13 @@ def _consume_process_output_live(
     logger,
     task_id: int,
     api: TaskApiClient,
+    credential_alert_lines: list[str] | None = None,
 ) -> tuple[str, str]:
+    """
+    credential_alert_lines, quando informado, recebe a linha de stdout que começa com
+    CREDENTIAL_ALERT_MARKER (a última vista). Ela é guardada antes da máscara só para
+    ser interpretada; nunca vai para log sem mascarar.
+    """
     output_queue: queue.Queue = queue.Queue()
 
     stdout_thread = threading.Thread(
@@ -1704,6 +1899,7 @@ def _consume_process_output_live(
 
             last_output_at = time.time()
             line = _shorten_text(line, 4000)
+            _note_credential_alert_line(credential_alert_lines, stream_name, line)
             if masker is not None:
                 line = masker.mask(line)
 
@@ -1736,6 +1932,7 @@ def _consume_process_output_live(
                 break
 
             line = _shorten_text(line, 4000)
+            _note_credential_alert_line(credential_alert_lines, stream_name, line)
             if masker is not None:
                 line = masker.mask(line)
 
@@ -1760,6 +1957,14 @@ def _consume_process_output_live(
         stderr_thread.join(timeout=1)
 
     return "\n".join(stdout_lines), "\n".join(stderr_lines)
+
+
+def _note_credential_alert_line(sink: list[str] | None, stream_name: str, line: str) -> None:
+    """Guarda a linha de alerta de credencial (só a última interessa)."""
+    if sink is None or stream_name != "stdout":
+        return
+    if line.lstrip().startswith(CREDENTIAL_ALERT_MARKER):
+        sink[:] = [line]
 
 
 def _append_capped(lines: list[str], line: str, max_lines: int) -> None:

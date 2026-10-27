@@ -567,5 +567,211 @@ class TaskEnvironmentTests(unittest.TestCase):
         self.assertNotIn("s3gredo", stdout)
 
 
+class CredentialAlertParsingTests(unittest.TestCase):
+    """Linha ORKAFLOW_ALERTA_CREDENCIAL {...} emitida pelo robô."""
+
+    def test_valid_json_line_is_parsed(self):
+        from app.runtime.task_executor import _parse_credential_alert_line
+
+        line = (
+            'ORKAFLOW_ALERTA_CREDENCIAL {"sistema":"SAP","chave":"sap_senha",'
+            '"motivo":"senha_expirada","mensagem":"Senha expirou no login."}'
+        )
+        parsed = _parse_credential_alert_line(line)
+
+        self.assertEqual(
+            parsed,
+            {"sistema": "SAP", "chave": "sap_senha", "motivo": "senha_expirada", "mensagem": "Senha expirou no login."},
+        )
+
+    def test_unknown_motivo_becomes_invalida(self):
+        from app.runtime.task_executor import _parse_credential_alert_line
+
+        parsed = _parse_credential_alert_line('ORKAFLOW_ALERTA_CREDENCIAL {"chave":"x","motivo":"qualquer"}')
+        self.assertEqual(parsed["motivo"], "invalida")
+
+    def test_invalid_json_still_counts_as_alert_with_raw_line_as_message(self):
+        from app.runtime.task_executor import _parse_credential_alert_line
+
+        line = "ORKAFLOW_ALERTA_CREDENCIAL isto nao e json " + "x" * 400
+        parsed = _parse_credential_alert_line(line)
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual((parsed["chave"], parsed["sistema"], parsed["motivo"]), (None, None, "invalida"))
+        self.assertTrue(parsed["mensagem"].startswith("ORKAFLOW_ALERTA_CREDENCIAL isto nao e json"))
+        self.assertEqual(len(parsed["mensagem"]), 300)
+
+    def test_line_without_marker_or_missing_is_not_an_alert(self):
+        from app.runtime.task_executor import _parse_credential_alert_line
+
+        self.assertIsNone(_parse_credential_alert_line(None))
+        self.assertIsNone(_parse_credential_alert_line(""))
+        self.assertIsNone(_parse_credential_alert_line("log normal do robo"))
+        self.assertIsNone(_parse_credential_alert_line("texto antes ORKAFLOW_ALERTA_CREDENCIAL {}"))
+
+    def test_alert_is_built_from_exit_code_3_without_marker_line(self):
+        from app.runtime.task_executor import _build_credential_alert
+
+        alert = _build_credential_alert(exit_code=3, marker_line=None, credential={"credential_id": 7, "keys": ["a"]})
+        self.assertEqual(
+            alert,
+            {
+                "credential_id": 7,
+                "chave": None,
+                "motivo": "invalida",
+                "mensagem": "Bot encerrou com código de saída 3.",
+                "sistema": None,
+            },
+        )
+
+    def test_no_alert_without_signal_and_alert_with_marker_on_exit_0(self):
+        from app.runtime.task_executor import _build_credential_alert
+
+        self.assertIsNone(_build_credential_alert(exit_code=0, marker_line=None, credential=None))
+        self.assertIsNone(_build_credential_alert(exit_code=1, marker_line=None, credential={"credential_id": 1}))
+
+        alert = _build_credential_alert(
+            exit_code=0,
+            marker_line='ORKAFLOW_ALERTA_CREDENCIAL {"chave":"senha","motivo":"usuario_bloqueado","mensagem":"bloqueado"}',
+            credential=None,
+        )
+        self.assertEqual(alert["credential_id"], None, "sem credencial resolvida o alerta vai mesmo assim")
+        self.assertEqual((alert["chave"], alert["motivo"], alert["mensagem"]), ("senha", "usuario_bloqueado", "bloqueado"))
+
+    def test_last_marker_line_from_stdout_is_kept(self):
+        from app.runtime.task_executor import _note_credential_alert_line
+
+        sink: list[str] = []
+        _note_credential_alert_line(sink, "stdout", "log qualquer")
+        _note_credential_alert_line(sink, "stderr", "ORKAFLOW_ALERTA_CREDENCIAL {\"chave\":\"no_stderr\"}")
+        self.assertEqual(sink, [])
+
+        _note_credential_alert_line(sink, "stdout", "ORKAFLOW_ALERTA_CREDENCIAL {\"chave\":\"primeira\"}")
+        _note_credential_alert_line(sink, "stdout", "  ORKAFLOW_ALERTA_CREDENCIAL {\"chave\":\"ultima\"}")
+        self.assertEqual(len(sink), 1)
+        self.assertIn("ultima", sink[0])
+
+    def test_send_failure_is_only_a_warning(self):
+        from app.runtime.task_executor import _send_credential_alert_safely
+
+        class _Api:
+            def send_credential_alert(self, task_id, **kwargs):
+                raise RuntimeError("backend fora")
+
+        logger = logging.getLogger("t.alert")
+        with self.assertLogs(logger, level="WARNING") as captured:
+            _send_credential_alert_safely(_Api(), 1, {"credential_id": 1, "motivo": "invalida", "mensagem": "m"}, logger)
+        self.assertTrue(any("Falha ao enviar alerta de credencial" in m for m in captured.output))
+
+
+class CredentialMaskingTests(unittest.TestCase):
+    class _Api:
+        def __init__(self, dados_acesso):
+            self.dados_acesso = dados_acesso
+            self.calls = []
+
+        def resolve_credential(self, credential_id, keys=None, task_id=None):
+            self.calls.append({"credential_id": credential_id, "keys": keys, "task_id": task_id})
+            return {"dados_acesso": self.dados_acesso}
+
+    def _task(self):
+        return {
+            "task_id": 42,
+            "parameters": [
+                {
+                    "parameter_name": "parameters_json",
+                    "parameter_value": json.dumps(
+                        {"dados_acesso": {"credential_id": 7, "itens": {"usuario": "", "senha": "", "pin": ""}}}
+                    ),
+                }
+            ],
+        }
+
+    def test_resolved_values_go_into_the_masker_and_resolution_is_recorded(self):
+        from app.runtime.task_executor import CredentialResolution, SecretMasker, _prepare_task_data_for_execution
+
+        api = self._Api({"usuario": "joao.silva", "senha": "S3nh@Forte", "pin": "12"})
+        resolution = CredentialResolution()
+
+        prepared = _prepare_task_data_for_execution(self._task(), api, logging.getLogger("t"), resolution=resolution)
+
+        self.assertEqual(api.calls, [{"credential_id": 7, "keys": ["usuario", "senha", "pin"], "task_id": 42}])
+        self.assertEqual(resolution.as_dict(), {"credential_id": 7, "keys": ["usuario", "senha", "pin"]})
+        self.assertEqual(sorted(resolution.secrets), ["S3nh@Forte", "joao.silva"], "valor curto (<4) fica de fora")
+
+        dados = json.loads(prepared["parameters"][0]["parameter_value"])["dados_acesso"]
+        self.assertEqual(dados["senha"], "S3nh@Forte", "o robô recebe o valor real")
+
+        masker = SecretMasker(["segredo_env"]).with_extra(resolution.secrets)
+        self.assertEqual(masker.mask("login joao.silva senha S3nh@Forte env segredo_env"), "login *** senha *** env ***")
+
+    def test_task_without_credential_has_no_resolution(self):
+        from app.runtime.task_executor import CredentialResolution, _prepare_task_data_for_execution
+
+        api = self._Api({})
+        resolution = CredentialResolution()
+        _prepare_task_data_for_execution({"task_id": 1, "parameters": []}, api, logging.getLogger("t"), resolution=resolution)
+
+        self.assertEqual(api.calls, [])
+        self.assertIsNone(resolution.as_dict())
+        self.assertEqual(resolution.secrets, [])
+
+
+class TaskApiClientCredentialTests(unittest.TestCase):
+    class _FakeClient:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, path, payload=None, **kwargs):
+            self.posts.append((path, dict(payload or {})))
+            return {"ok": True}
+
+    def _api(self):
+        from app.runtime.task_client import TaskApiClient
+
+        client = self._FakeClient()
+        return client, TaskApiClient(client=client, runner_uuid="uuid-1", runner_token="tok-1")
+
+    def test_resolve_credential_sends_task_id(self):
+        client, api = self._api()
+
+        api.resolve_credential(credential_id=7, keys=["usuario", "senha"], task_id=42)
+
+        self.assertEqual(
+            client.posts,
+            [("/api/v1/worker/credentials/7/resolve", {"uuid": "uuid-1", "token": "tok-1", "keys": ["usuario", "senha"], "task_id": 42})],
+        )
+
+    def test_resolve_credential_without_task_id_keeps_old_body(self):
+        client, api = self._api()
+        api.resolve_credential(credential_id=7, keys=["senha"])
+        self.assertNotIn("task_id", client.posts[0][1])
+
+    def test_send_credential_alert_contract(self):
+        client, api = self._api()
+
+        api.send_credential_alert(
+            42, credential_id=7, chave="sap_senha", motivo="senha_expirada", mensagem="Senha expirou.", sistema="SAP"
+        )
+
+        self.assertEqual(
+            client.posts,
+            [
+                (
+                    "/api/v1/worker/tasks/42/credential-alert",
+                    {
+                        "uuid": "uuid-1",
+                        "token": "tok-1",
+                        "credential_id": 7,
+                        "chave": "sap_senha",
+                        "motivo": "senha_expirada",
+                        "mensagem": "Senha expirou.",
+                        "sistema": "SAP",
+                    },
+                )
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
