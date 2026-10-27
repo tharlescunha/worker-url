@@ -8,6 +8,7 @@ para o worker não depender do venv de nenhum bot.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -20,7 +21,8 @@ EVENT_STEP = "step"
 EVENT_SCREENSHOT = "screenshot"
 EVENT_HEARTBEAT = "heartbeat"
 EVENT_END = "end"
-KNOWN_EVENTS = {EVENT_HELLO, EVENT_LOG, EVENT_STEP, EVENT_SCREENSHOT, EVENT_HEARTBEAT, EVENT_END}
+EVENT_ATTACH = "attach"
+KNOWN_EVENTS = {EVENT_HELLO, EVENT_LOG, EVENT_STEP, EVENT_SCREENSHOT, EVENT_HEARTBEAT, EVENT_END, EVENT_ATTACH}
 
 LEVEL_INFO = "info"
 LEVEL_WARNING = "warning"
@@ -28,6 +30,8 @@ LEVEL_ERROR = "error"
 LEVELS = {LEVEL_INFO, LEVEL_WARNING, LEVEL_ERROR}
 
 MAX_SCREENSHOTS_KEPT = 5
+MAX_ATTACHMENTS_PER_TASK = 10
+ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024
 # error_type enviado ao backend conforme a categoria do fail() do robô.
 ERROR_TYPE_BY_CATEGORY = {"business": "bot_business_error", "system": "bot_system_error"}
 
@@ -55,6 +59,9 @@ class MaestroState:
     end: MaestroEnd | None = None
     last_step: MaestroStep | None = None
     screenshots: list[dict[str, Any]] = field(default_factory=list)
+    # Anexos pedidos pelo robô (attach): {path, name, description, size}; o executor envia.
+    attachments: list[dict[str, Any]] = field(default_factory=list)
+    attachments_sent: int = 0
     events_seen: int = 0
     invalid_lines: int = 0
 
@@ -129,6 +136,19 @@ def _apply(state: MaestroState, event: dict[str, Any]) -> tuple[str, str, bool]:
         description = _text(event.get("description"))
         return LEVEL_INFO, "Print da tela registrado pelo robô" + (f": {description}" if description else "."), True
 
+    if kind == EVENT_ATTACH:
+        path = _text(event.get("path"))
+        name = _text(event.get("name")) or (os.path.basename(path) if path else None)
+        if not path:
+            return LEVEL_WARNING, "Anexo ignorado: o robô não informou o caminho do arquivo.", True
+        if len(state.attachments) >= MAX_ATTACHMENTS_PER_TASK:
+            return LEVEL_WARNING, f"Anexo ignorado ({name}): limite de {MAX_ATTACHMENTS_PER_TASK} arquivos por task.", True
+        state.attachments.append(
+            {"path": path, "name": name, "description": _text(event.get("description")), "size": _int(event.get("size"))}
+        )
+        description = _text(event.get("description"))
+        return LEVEL_INFO, f"Arquivo anexado pelo robô: {name}" + (f" ({description})" if description else ""), True
+
     if kind == EVENT_HEARTBEAT:
         # Só serve para o relógio de inatividade; não polui o log da task.
         return LEVEL_INFO, "", False
@@ -138,8 +158,11 @@ def _apply(state: MaestroState, event: dict[str, Any]) -> tuple[str, str, bool]:
     message = _text(event.get("message")) or ("Task finalizada com sucesso." if status == "success" else "Robô encerrou com erro.")
     category = _text(event.get("category"))
     state.end = MaestroEnd(status=status, message=message, category=category, retryable=bool(event.get("retryable")))
-    next_bots = event.get("next_bots")
-    tail = f" Próximos robôs: {', '.join(str(b) for b in next_bots)}." if isinstance(next_bots, list) and next_bots else ""
+    next_automations = event.get("next_automations")
+    tail = (
+        f" Próximas automações: {', '.join(str(b) for b in next_automations)}."
+        if isinstance(next_automations, list) and next_automations else ""
+    )
     level = LEVEL_ERROR if status == "error" else LEVEL_INFO
     return level, f"Robô encerrou ({status}): {message}{tail}", True
 

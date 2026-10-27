@@ -66,6 +66,32 @@ class TaskInfo:
 
 
 class Maestro:
+    """Conversa do robô com o orquestrador.
+
+    Crie uma instância no topo do robô e use ``with maestro:`` em volta do ``main()``::
+
+        from maestro import Maestro, CredencialInvalida
+        maestro = Maestro()                 # producao=True por padrão
+
+        def main():
+            filial = maestro.param("filial", default="010")
+            senha = maestro.credential("sap_senha")
+            maestro.step(1, 2, "Login no SAP")
+            maestro.info("Lendo pedidos", filial=filial)
+            maestro.success("42 pedidos", result={"pedidos": 42})
+
+        if __name__ == "__main__":
+            with maestro:
+                main()
+
+    Parâmetros:
+        producao: True (padrão) nas máquinas do orquestrador. False na sua máquina: lê ``task.json``
+            ao lado do robô, imprime no console e grava ``resultado.json``; nada vai para a rede.
+        screenshot_on_error: True para tirar print da tela quando uma exceção escapar do ``with``.
+            Use em robô de tela (SAP, navegador). Padrão False.
+        task_file / result_file: caminhos explícitos (normalmente não precisa; o worker informa).
+    """
+
     def __init__(
         self,
         producao: bool = True,
@@ -88,7 +114,7 @@ class Maestro:
         self._env_local: dict[str, str] = {}
         self._task = TaskInfo()
 
-        self._next_bots: list[dict[str, Any]] = []
+        self._next_automations: list[dict[str, Any]] = []
         self._result: Any = None
         self._finished = False
         self._screenshot_seq = 0
@@ -107,6 +133,9 @@ class Maestro:
         return dict(self._params)
 
     def param(self, name: str, default: Any = None) -> Any:
+        """Parâmetro da task pelo nome. Procura em ``parameters_json`` e depois em ``runtime_parameters_json``.
+
+        Exemplo: ``filial = maestro.param("filial", default="010")``"""
         self._ensure_loaded()
         return self._params.get(name, default)
 
@@ -118,7 +147,10 @@ class Maestro:
         return self._params[name]
 
     def credential(self, key: str, default: Any = ...) -> Any:
-        """Valor já resolvido de dados_acesso (ex.: 'sap_senha'). Nunca logue o retorno."""
+        """Valor de uma credencial cadastrada em Credenciais e vinculada à automação (``dados_acesso``).
+
+        Exemplo: ``senha = maestro.credential("sap_senha")``. Falha com mensagem clara se a chave não
+        veio na task. O valor já chega mascarado no log: mesmo assim, nunca imprima a senha."""
         self._ensure_loaded()
         if key in self._credentials and self._credentials[key] is not None:
             return self._credentials[key]
@@ -133,7 +165,9 @@ class Maestro:
         return dict(self._credentials)
 
     def env(self, name: str, default: str | None = None) -> str | None:
-        """Variável de ambiente (as do orquestrador o worker injeta no processo)."""
+        """Variável de ambiente cadastrada no orquestrador (tela Variáveis) ou do sistema.
+
+        Exemplo: ``url = maestro.env("SAP_URL")``"""
         self._ensure_loaded()
         value = os.environ.get(name)
         if value is None:
@@ -142,9 +176,15 @@ class Maestro:
 
     # ------------------------------------------------------------------- saída
     def info(self, message: str, **data: Any) -> None:
+        """Mensagem informativa no log da task. Campos extras viram ``chave=valor``.
+
+        Exemplo: ``maestro.info("Lendo pedidos", total=120)``"""
         self._log("info", message, data)
 
     def warning(self, message: str, **data: Any) -> None:
+        """Aviso no log da task (amarelo): algo fora do esperado que não impede o robô.
+
+        Exemplo: ``maestro.warning("Linha sem CNPJ", linha=37)``"""
         self._log("warning", message, data)
 
     def error(self, message: str, **data: Any) -> None:
@@ -152,14 +192,26 @@ class Maestro:
         self._log("error", message, data)
 
     def step(self, current: int, total: int | None = None, text: str | None = None) -> None:
+        """Etapa atual: aparece na lista e no detalhe da task como "Etapa 3 de 7 · texto".
+
+        Exemplo: ``maestro.step(3, 7, "Enviando ao SAP")``"""
         self._emit({"type": protocol.EVENT_STEP, "current": int(current), "total": None if total is None else int(total), "text": protocol.shorten(text, 200)})
 
     def heartbeat(self) -> None:
-        """Para laços longos sem saída: evita o worker achar que o robô travou."""
+        """Sinal de vida para laços longos sem log: evita o worker encerrar o robô por inatividade.
+
+        Chame a cada poucos minutos dentro de processamentos demorados e silenciosos."""
         self._emit({"type": protocol.EVENT_HEARTBEAT, "at": datetime.now().isoformat(timespec="seconds")})
 
     @contextmanager
     def timer(self, label: str) -> Iterator[None]:
+        """Mede e loga a duração de um trecho.
+
+        Exemplo::
+
+            with maestro.timer("Login SAP"):
+                sap.login(usuario, senha)
+        """
         started = time.monotonic()
         self.info(f"{label}: início")
         try:
@@ -168,7 +220,10 @@ class Maestro:
             self.info(f"{label}: {time.monotonic() - started:.1f}s")
 
     def screenshot(self, description: str | None = None) -> Path | None:
-        """Tira um print da tela agora e anexa à task. Devolve o caminho do PNG ou None se falhou."""
+        """Tira um print da tela agora e anexa à task (aparece no detalhe, no erro). Devolve o caminho do PNG.
+
+        Exemplo: ``maestro.screenshot("Tela do SAP antes de gravar")``. Com ``screenshot_on_error=True``
+        o print no erro é automático."""
         self._screenshot_seq += 1
         target = self._screenshot_path(self._screenshot_seq)
         ok = capture_screen(target)
@@ -178,27 +233,66 @@ class Maestro:
         self._emit({"type": protocol.EVENT_SCREENSHOT, "path": str(target), "description": protocol.shorten(description, 200)})
         return target
 
-    def next_bot(self, automation: str | int, parametros: dict[str, Any] | None = None) -> None:
-        """Ao terminar com sucesso, coloca outra automação na fila (nome ou id)."""
+    def attach(self, path: str | os.PathLike[str], description: str | None = None) -> bool:
+        """Anexa um arquivo à task (planilha, PDF, log...). Até 5 MB por arquivo; aparece na tela da task.
+
+        O worker lê o arquivo na hora: pode apagar o arquivo depois da chamada."""
+        file_path = Path(path)
+        try:
+            if not file_path.is_file():
+                self.warning(f"Anexo ignorado: arquivo não encontrado: {file_path}")
+                return False
+            size = file_path.stat().st_size
+        except OSError as exc:
+            self.warning(f"Anexo ignorado: não consegui ler {file_path}: {exc}")
+            return False
+        if size <= 0:
+            self.warning(f"Anexo ignorado: arquivo vazio: {file_path.name}")
+            return False
+        if size > protocol.ATTACH_MAX_BYTES:
+            self.warning(f"Anexo ignorado: {file_path.name} tem {size} bytes (limite {protocol.ATTACH_MAX_BYTES}).")
+            return False
+        self._emit({
+            "type": protocol.EVENT_ATTACH,
+            "path": str(file_path.resolve()),
+            "name": file_path.name,
+            "size": size,
+            "description": protocol.shorten(description, 200),
+        })
+        return True
+
+    def next_automation(self, automation: str | int, parametros: dict[str, Any] | None = None) -> None:
+        """Ao terminar com sucesso, coloca outra automação na fila, pelo nome (ou id).
+
+        A automação leva os parâmetros, credenciais e padrões dela, como em "Nova task";
+        ``parametros`` é opcional e só sobrescreve o que você quiser."""
         if parametros is not None and not isinstance(parametros, dict):
-            raise MaestroError("parametros de next_bot precisa ser um dicionário.")
+            raise MaestroError("parametros de next_automation precisa ser um dicionário.")
         item: dict[str, Any] = {"parameters": parametros}
         if isinstance(automation, int):
             item["automation_id"] = automation
         else:
             item["automation"] = str(automation).strip()
-        self._next_bots.append(item)
+        self._next_automations.append(item)
 
     # ------------------------------------------------------------ encerramento
     def success(self, message: str | None = None, result: Any = None) -> None:
-        """Grava o resultado, avisa o worker e encerra o processo com código 0."""
+        """Encerra o robô com sucesso: ``message`` vira a mensagem final da task e ``result`` (dict)
+        vira o resultado, que alimenta eventos e o próximo robô.
+
+        Exemplo: ``maestro.success("42 pedidos lidos", result={"pedidos": 42})``"""
         self._result = result
         self._write_result()
         self._end("success", message or "Task finalizada com sucesso.")
         raise SystemExit(EXIT_SUCCESS)
 
     def fail(self, message: str, category: str = "system", retryable: bool | None = None, exit_code: int = EXIT_ERROR) -> None:
-        """Encerra com erro. category: business (regra de negócio) ou system (ambiente)."""
+        """Encerra o robô com erro e ``message`` como mensagem final da task.
+
+        ``category``: ``"business"`` (regra de negócio, não adianta repetir) ou ``"system"`` (ambiente,
+        pode repetir). ``retryable`` força o que a retentativa automática deve fazer.
+
+        Exemplo: ``maestro.fail("Planilha não encontrada", category="business")``"""
         if category not in protocol.CATEGORIES:
             category = "system"
         if retryable is None:
@@ -207,6 +301,12 @@ class Maestro:
         raise SystemExit(exit_code if exit_code != 0 else EXIT_ERROR)
 
     def credential_invalid(self, chave: str | None, motivo: str = "invalida", mensagem: str | None = None, sistema: str | None = None) -> None:
+        """Avisa que a credencial não serve mais e encerra (mesmo que ``raise CredencialInvalida(...)``).
+
+        ``motivo``: ``senha_incorreta`` | ``senha_expirada`` | ``usuario_bloqueado``. O orquestrador pausa
+        os agendamentos e bloqueia tasks novas até alguém trocar a senha: assim o usuário não é bloqueado.
+
+        Exemplo: ``maestro.credential_invalid("sap_senha", "senha_expirada", "SAP avisou que a senha venceu")``"""
         raise CredencialInvalida(chave, motivo=motivo, mensagem=mensagem, sistema=sistema)
 
     # --------------------------------------------------------- bloco `with`
@@ -341,9 +441,9 @@ class Maestro:
             payload = {}
         else:
             payload = {"result": self._result}
-        if self._next_bots:
+        if self._next_automations:
             workflow = _as_dict(payload.get("orkaflow"))
-            workflow["next_automations"] = list(self._next_bots)
+            workflow["next_automations"] = list(self._next_automations)
             payload["orkaflow"] = workflow
         if not payload:
             return
@@ -361,8 +461,8 @@ class Maestro:
         if status == "error":
             event["category"] = category or "system"
             event["retryable"] = bool(retryable)
-        if self._next_bots:
-            event["next_bots"] = [b.get("automation") or b.get("automation_id") for b in self._next_bots]
+        if self._next_automations:
+            event["next_automations"] = [b.get("automation") or b.get("automation_id") for b in self._next_automations]
         self._emit(event)
 
     def _log(self, level: str, message: str, data: dict[str, Any]) -> None:
@@ -430,10 +530,12 @@ def _format_local(event: dict[str, Any]) -> str:
         return f"[SCREENSHOT] {event.get('path')} {event.get('description') or ''}".rstrip()
     if kind == protocol.EVENT_HEARTBEAT:
         return "[HEARTBEAT]"
+    if kind == protocol.EVENT_ATTACH:
+        return f"[ATTACH] {event.get('name')} ({event.get('size')} bytes) {event.get('description') or ''}".rstrip()
     if kind == protocol.EVENT_END:
         status = str(event.get("status", "")).upper()
         tail = ""
-        if event.get("next_bots"):
-            tail = f" | próximos robôs: {event['next_bots']}"
+        if event.get("next_automations"):
+            tail = f" | próximas automações: {event['next_automations']}"
         return f"[END {status}] {event.get('message')}{tail}"
     return json.dumps(event, ensure_ascii=False, default=str)

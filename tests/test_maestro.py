@@ -129,7 +129,7 @@ class ProductionModeTests(unittest.TestCase):
         m.info("Lendo", total=3)
         m.warning("Aviso")
         m.step(2, 5, "Enviando")
-        m.next_bot("Aprovacao", parametros={"lote": "A"})
+        m.next_automation("Aprovacao", parametros={"lote": "A"})
         with self.assertRaises(SystemExit) as ctx:
             m.success("Feito", result={"pedidos": 3})
         self.assertEqual(ctx.exception.code, 0)
@@ -141,7 +141,7 @@ class ProductionModeTests(unittest.TestCase):
         types = [e["type"] for e in _events(self.out)]
         self.assertEqual(types, ["hello", "log", "log", "step", "end"])
         end = _events(self.out)[-1]
-        self.assertEqual((end["status"], end["message"], end["next_bots"]), ("success", "Feito", ["Aprovacao"]))
+        self.assertEqual((end["status"], end["message"], end["next_automations"]), ("success", "Feito", ["Aprovacao"]))
 
     def test_fail_emits_error_end_and_exit_1(self):
         m = Maestro(stream=self.out)

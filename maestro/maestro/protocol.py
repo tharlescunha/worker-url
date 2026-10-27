@@ -27,6 +27,10 @@ EVENT_STEP = "step"
 EVENT_SCREENSHOT = "screenshot"
 EVENT_HEARTBEAT = "heartbeat"
 EVENT_END = "end"
+EVENT_ATTACH = "attach"
+
+# Anexo: o worker lê o arquivo na hora e envia ao orquestrador (limite por arquivo).
+ATTACH_MAX_BYTES = 5 * 1024 * 1024
 
 LEVELS = ("info", "warning", "error")
 CATEGORIES = ("business", "system")

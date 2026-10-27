@@ -75,7 +75,7 @@ class HandleLineTests(unittest.TestCase):
         _, _, send = me.handle_line(state, 'MAESTRO {"type":"heartbeat"}')
         self.assertFalse(send)
 
-        level, text, _ = me.handle_line(state, 'MAESTRO {"type":"end","status":"error","message":"Planilha sumiu","category":"business","retryable":false,"next_bots":[]}')
+        level, text, _ = me.handle_line(state, 'MAESTRO {"type":"end","status":"error","message":"Planilha sumiu","category":"business","retryable":false,"next_automations":[]}')
         self.assertEqual(level, "error")
         self.assertIn("Planilha sumiu", text)
         self.assertEqual((state.end.status, state.end.category, state.end.retryable), ("error", "business", False))

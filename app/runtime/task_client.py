@@ -20,6 +20,7 @@ ERROR_TASK_PATH = "/api/v1/worker/tasks/{task_id}/errors"
 CREDENTIAL_ALERT_TASK_PATH = "/api/v1/worker/tasks/{task_id}/credential-alert"
 TELEMETRY_TASK_PATH = "/api/v1/worker/tasks/{task_id}/telemetry"
 PROGRESS_TASK_PATH = "/api/v1/worker/tasks/{task_id}/progress"
+ATTACHMENT_TASK_PATH = "/api/v1/worker/tasks/{task_id}/attachments"
 HEARTBEAT_PATH = "/api/v1/worker/heartbeat/"
 RESOLVE_CREDENTIAL_PATH = "/api/v1/worker/credentials/{credential_id}/resolve"
 TASK_ENV_PATH = "/api/v1/worker/tasks/{task_id}/env"
@@ -271,6 +272,21 @@ class TaskApiClient:
         payload["total"] = None if total is None else int(total)
         payload["text"] = text
         return self.client.post(PROGRESS_TASK_PATH.format(task_id=task_id), payload)
+
+    def send_attachment(
+        self, task_id: int, *, filename: str, content_type: str, description: str | None, content_base64: str
+    ) -> dict:
+        """Arquivo anexado pelo robô (maestro.attach). Com retentativa: o arquivo já foi lido."""
+        payload = self._auth_payload()
+        payload["filename"] = filename
+        payload["content_type"] = content_type
+        payload["description"] = description
+        payload["content_base64"] = content_base64
+        return self._with_retry(
+            lambda: self.client.post(ATTACHMENT_TASK_PATH.format(task_id=task_id), payload),
+            operation_name="send_attachment",
+            task_id=task_id,
+        )
 
     def send_credential_alert(
         self,

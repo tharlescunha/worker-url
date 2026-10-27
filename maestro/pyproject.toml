@@ -13,3 +13,6 @@ dependencies = []
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["maestro*"]
+
+[tool.setuptools.package-data]
+maestro = ["py.typed"]

@@ -1933,6 +1933,7 @@ def _consume_process_output_live(
                 if handled is not None:
                     level, log_message, send_to_task_log = handled
                     _send_maestro_progress_if_changed(maestro_state, api, task_id, logger)
+                    _send_maestro_attachments_if_new(maestro_state, api, task_id, logger)
             else:
                 _append_capped(stderr_lines, line, MAX_CAPTURED_OUTPUT_LINES)
                 level, error_type = _classify_stderr_log(line)
@@ -2017,6 +2018,47 @@ def _send_maestro_progress_if_changed(
             logger.warning("Progresso da task %s não enviado (%s): segue sem ele.", task_id, exc)
 
     threading.Thread(target=_run, name=f"maestro-progress-{task_id}", daemon=True).start()
+
+
+def _send_maestro_attachments_if_new(
+    state: maestro_events.MaestroState | None, api: TaskApiClient, task_id: int, logger
+) -> None:
+    """Lê o arquivo na hora (o robô pode apagá-lo depois) e envia ao backend numa thread própria."""
+    if state is None or state.attachments_sent >= len(state.attachments):
+        return
+    send = getattr(api, "send_attachment", None)
+    pending = state.attachments[state.attachments_sent :]
+    state.attachments_sent = len(state.attachments)
+    if send is None:
+        return
+    for item in pending:
+        path = Path(str(item.get("path") or ""))
+        try:
+            if not path.is_file():
+                logger.warning("Anexo do maestro não encontrado: %s", path)
+                continue
+            if path.stat().st_size > maestro_events.ATTACHMENT_MAX_BYTES:
+                logger.warning("Anexo do maestro acima do limite: %s", path)
+                continue
+            data = path.read_bytes()
+        except Exception:  # noqa: BLE001
+            logger.warning("Não foi possível ler o anexo do maestro: %s", path)
+            continue
+        import base64
+        import mimetypes
+
+        content_b64 = base64.b64encode(data).decode("ascii")
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        name = str(item.get("name") or path.name)
+        description = item.get("description")
+
+        def _run(name=name, content_type=content_type, description=description, content_b64=content_b64) -> None:
+            try:
+                send(task_id, filename=name, content_type=content_type, description=description, content_base64=content_b64)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Anexo %s da task %s não enviado (%s).", name, task_id, exc)
+
+        threading.Thread(target=_run, name=f"maestro-attach-{task_id}", daemon=True).start()
 
 
 def _maestro_final_message(state: maestro_events.MaestroState | None, default: str) -> str:
