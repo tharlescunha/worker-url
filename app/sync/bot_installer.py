@@ -12,6 +12,7 @@ from app.core.config_models import BotRegistryItem
 from app.core.constants import BOTS_DIR, VENVS_DIR
 from app.core.exceptions import BotInstallError
 from app.core.log_masking import mask_url_credentials
+from app.sync.maestro_install import ensure_maestro_in_venv
 
 
 ProgressCallback = Callable[[str], None]
@@ -82,6 +83,8 @@ def install_or_update_bot(
         progress_callback=progress_callback,
         bot_label=bot_label,
     )
+    # Biblioteca do robô (maestro): cópia local, nunca falha a instalação do bot.
+    ensure_maestro_in_venv(venv_dir, progress_callback=progress_callback, bot_label=bot_label)
 
     message = (
         f"Bot preparado com sucesso. "

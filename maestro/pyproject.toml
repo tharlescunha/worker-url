@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maestro"
+version = "1.0.0"
+description = "Biblioteca do robô para conversar com o orquestrador (OrkaFlow): parâmetros, credenciais, logs, progresso, print de erro, resultado e próximo robô."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["maestro*"]

@@ -240,6 +240,7 @@ class TaskApiClient:
         stacktrace: str | None = None,
         code: str | None = None,
         is_retryable: bool = False,
+        error_screenshot_base64: str | None = None,
     ) -> dict:
         payload = self._auth_payload()
         payload["error_type"] = error_type
@@ -250,6 +251,8 @@ class TaskApiClient:
 
         if code is not None:
             payload["code"] = code
+        if error_screenshot_base64:
+            payload["error_screenshot_base64"] = error_screenshot_base64
 
         return self._with_retry(
             lambda: self.client.post(

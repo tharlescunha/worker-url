@@ -9,6 +9,7 @@ from app.core.constants import BOTS_REGISTRY_FILE
 from app.core.http_client import HttpClient
 from app.core.json_store import load_model, save_model
 from app.runtime.bot_usage import REGISTRY_LOCK, bot_usage
+from app.sync.maestro_install import ensure_maestro_in_venv
 from app.sync.bot_installer import (
     install_or_update_bot,
     install_retry_allowed,
@@ -194,6 +195,15 @@ def _sync_bots_locked(
             current.last_install_status = "ok"
             current.last_install_message = "Bot alinhado com a versão esperada."
             register_install_success(current)
+            if current.venv_path:
+                try:
+                    ensure_maestro_in_venv(
+                        current.venv_path,
+                        progress_callback=progress_callback,
+                        bot_label=current.name or current.bot_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
         updated_items.append(current)
 

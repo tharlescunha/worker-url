@@ -30,6 +30,7 @@ from app.core.json_store import load_model, save_model
 from app.runtime import cleanup as process_cleanup
 from app.runtime.bot_usage import REGISTRY_LOCK, bot_usage
 from app.runtime.events import EventReporter
+from app.runtime import maestro_events
 from app.runtime.screenshot_reporter import acquire_screenshots, release_screenshots
 from app.runtime.services import describe_session, is_input_desktop_available
 from app.runtime.task_client import TaskApiClient
@@ -156,6 +157,7 @@ def execute_task(
     process: subprocess.Popen | None = None
     task_file: Path | None = None
     result_file: Path | None = None
+    maestro_state: maestro_events.MaestroState | None = None
     telemetry_collector: ProcessTelemetryCollector | None = None
     screenshots_acquired = False
     bot_running = None
@@ -308,6 +310,8 @@ def execute_task(
             raise RuntimeError("stdout/stderr do processo não foram inicializados.")
 
         credential_alert_lines: list[str] = []
+        # Robô com a biblioteca maestro: o que ele contou (fim, etapa, prints). Vazio sem maestro.
+        maestro_state = maestro_events.MaestroState()
         stdout_text, stderr_text = _consume_process_output_live(
             process=process,
             timeout_seconds=timeout_seconds,
@@ -317,6 +321,7 @@ def execute_task(
             task_id=task_id,
             api=api,
             credential_alert_lines=credential_alert_lines,
+            maestro_state=maestro_state,
         )
 
         telemetry = telemetry_collector.stop(
@@ -361,7 +366,7 @@ def execute_task(
             api.finish_task(
                 task_id=task_id,
                 status=TASK_STATUS_FINISHED,
-                final_message="Task finalizada com sucesso.",
+                final_message=_maestro_final_message(maestro_state, "Task finalizada com sucesso."),
                 items_processed=0,
                 items_failed=0,
                 result_json=result_json,
@@ -373,10 +378,18 @@ def execute_task(
 
         error_message = f"Bot finalizou com código de saída {process.returncode}."
         error_type = "bot_exit_code"
+        is_retryable = False
+        if maestro_state.end is not None and maestro_state.end.status == "error":
+            # O robô explicou o erro pelo maestro: usa a explicação dele.
+            error_message = f"{maestro_state.end.message} (código de saída {process.returncode})"
+            error_type = maestro_events.error_type_for(maestro_state.end, error_type)
+            is_retryable = bool(maestro_state.end.retryable)
         if credential_alert is not None and process.returncode == CREDENTIAL_ALERT_EXIT_CODE:
-            error_message = f"Credencial inválida: {credential_alert['mensagem']} {error_message}"
+            error_message = f"Credencial inválida: {credential_alert['mensagem']} Bot finalizou com código de saída {process.returncode}."
             error_type = "credential_invalid"
+            is_retryable = False
         trace_text = _build_stacktrace(stderr_text, stdout_text)
+        error_screenshot_base64 = _load_maestro_screenshot_base64(maestro_state, logger)
 
         try:
             api.send_error(
@@ -385,7 +398,8 @@ def execute_task(
                 message=error_message,
                 stacktrace=trace_text,
                 code=str(process.returncode),
-                is_retryable=False,
+                is_retryable=is_retryable,
+                error_screenshot_base64=error_screenshot_base64,
             )
         except Exception as exc:
             logger.exception("Falha ao registrar task_error | task_id=%s", task_id)
@@ -654,6 +668,8 @@ def execute_task(
                 result_file.unlink()
             except Exception:
                 logger.warning("Não foi possível remover o arquivo temporário de resultado: %s", result_file)
+
+        _cleanup_maestro_screenshots(maestro_state, logger)
 
 
 class ProcessTelemetryCollector:
@@ -1838,11 +1854,15 @@ def _consume_process_output_live(
     task_id: int,
     api: TaskApiClient,
     credential_alert_lines: list[str] | None = None,
+    maestro_state: maestro_events.MaestroState | None = None,
 ) -> tuple[str, str]:
     """
     credential_alert_lines, quando informado, recebe a linha de stdout que começa com
     CREDENTIAL_ALERT_MARKER (a última vista). Ela é guardada antes da máscara só para
     ser interpretada; nunca vai para log sem mascarar.
+
+    maestro_state, quando informado, recebe o que o robô contou pelas linhas MAESTRO
+    (já mascaradas). Linha que não parsear segue como texto comum.
     """
     output_queue: queue.Queue = queue.Queue()
 
@@ -1903,11 +1923,16 @@ def _consume_process_output_live(
             if masker is not None:
                 line = masker.mask(line)
 
+            log_message = line
+            send_to_task_log = True
             if stream_name == "stdout":
                 _append_capped(stdout_lines, line, MAX_CAPTURED_OUTPUT_LINES)
                 logger.info("[BOT][task_id=%s] %s", task_id, line)
                 level = LOG_LEVEL_INFO
                 error_type = None
+                handled = maestro_events.handle_line(maestro_state, line)
+                if handled is not None:
+                    level, log_message, send_to_task_log = handled
             else:
                 _append_capped(stderr_lines, line, MAX_CAPTURED_OUTPUT_LINES)
                 level, error_type = _classify_stderr_log(line)
@@ -1916,12 +1941,13 @@ def _consume_process_output_live(
                 else:
                     logger.warning("[BOT][task_id=%s] %s", task_id, line)
 
-            log_sender.enqueue(
-                level=level,
-                message=line,
-                error_type=error_type,
-                sequence_number=sequence,
-            )
+            if send_to_task_log:
+                log_sender.enqueue(
+                    level=level,
+                    message=log_message,
+                    error_type=error_type,
+                    sequence_number=sequence,
+                )
 
             sequence += 1
 
@@ -1936,20 +1962,26 @@ def _consume_process_output_live(
             if masker is not None:
                 line = masker.mask(line)
 
+            log_message = line
+            send_to_task_log = True
             if stream_name == "stdout":
                 _append_capped(stdout_lines, line, MAX_CAPTURED_OUTPUT_LINES)
                 level = LOG_LEVEL_INFO
                 error_type = None
+                handled = maestro_events.handle_line(maestro_state, line)
+                if handled is not None:
+                    level, log_message, send_to_task_log = handled
             else:
                 _append_capped(stderr_lines, line, MAX_CAPTURED_OUTPUT_LINES)
                 level, error_type = _classify_stderr_log(line)
 
-            log_sender.enqueue(
-                level=level,
-                message=line,
-                error_type=error_type,
-                sequence_number=sequence,
-            )
+            if send_to_task_log:
+                log_sender.enqueue(
+                    level=level,
+                    message=log_message,
+                    error_type=error_type,
+                    sequence_number=sequence,
+                )
             sequence += 1
     finally:
         log_sender.close()
@@ -1957,6 +1989,59 @@ def _consume_process_output_live(
         stderr_thread.join(timeout=1)
 
     return "\n".join(stdout_lines), "\n".join(stderr_lines)
+
+
+MAESTRO_SCREENSHOT_MAX_BYTES = 2 * 1024 * 1024
+MAESTRO_SCREENSHOT_MAX_WIDTH = 1600
+
+
+def _maestro_final_message(state: maestro_events.MaestroState | None, default: str) -> str:
+    if state is None or state.end is None or state.end.status != "success":
+        return default
+    return _shorten_text(state.end.message or default, 3500)
+
+
+def _load_maestro_screenshot_base64(state: maestro_events.MaestroState | None, logger) -> str | None:
+    """Último print que o robô tirou pelo maestro, em JPEG base64 (ou None). Nunca levanta."""
+    if state is None or not state.screenshots:
+        return None
+    path = Path(str(state.screenshots[-1].get("path") or ""))
+    try:
+        if not path.exists() or path.stat().st_size <= 0:
+            return None
+        from io import BytesIO
+
+        from PIL import Image
+
+        with Image.open(path) as img:
+            img = img.convert("RGB")
+            if img.width > MAESTRO_SCREENSHOT_MAX_WIDTH:
+                ratio = MAESTRO_SCREENSHOT_MAX_WIDTH / float(img.width)
+                img = img.resize((MAESTRO_SCREENSHOT_MAX_WIDTH, max(1, int(img.height * ratio))))
+            buffer = BytesIO()
+            img.save(buffer, format="JPEG", quality=70, optimize=True)
+        data = buffer.getvalue()
+        if len(data) > MAESTRO_SCREENSHOT_MAX_BYTES:
+            logger.warning("Print do maestro ignorado: %s bytes acima do limite.", len(data))
+            return None
+        import base64
+
+        return base64.b64encode(data).decode("ascii")
+    except Exception:  # noqa: BLE001
+        logger.warning("Não foi possível preparar o print do maestro: %s", path)
+        return None
+
+
+def _cleanup_maestro_screenshots(state: maestro_events.MaestroState | None, logger) -> None:
+    if state is None:
+        return
+    for item in state.screenshots:
+        path = Path(str(item.get("path") or ""))
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:  # noqa: BLE001
+            logger.warning("Não foi possível remover o print do maestro: %s", path)
 
 
 def _note_credential_alert_line(sink: list[str] | None, stream_name: str, line: str) -> None:
