@@ -19,6 +19,7 @@ LOG_TASK_PATH = "/api/v1/worker/tasks/{task_id}/logs"
 ERROR_TASK_PATH = "/api/v1/worker/tasks/{task_id}/errors"
 CREDENTIAL_ALERT_TASK_PATH = "/api/v1/worker/tasks/{task_id}/credential-alert"
 TELEMETRY_TASK_PATH = "/api/v1/worker/tasks/{task_id}/telemetry"
+PROGRESS_TASK_PATH = "/api/v1/worker/tasks/{task_id}/progress"
 HEARTBEAT_PATH = "/api/v1/worker/heartbeat/"
 RESOLVE_CREDENTIAL_PATH = "/api/v1/worker/credentials/{credential_id}/resolve"
 TASK_ENV_PATH = "/api/v1/worker/tasks/{task_id}/env"
@@ -262,6 +263,14 @@ class TaskApiClient:
             operation_name="send_error",
             task_id=task_id,
         )
+
+    def send_progress(self, task_id: int, *, current: int, total: int | None, text: str | None) -> dict:
+        """Etapa atual do robô (maestro.step). Sem retentativa: é só informativo."""
+        payload = self._auth_payload()
+        payload["current"] = int(current)
+        payload["total"] = None if total is None else int(total)
+        payload["text"] = text
+        return self.client.post(PROGRESS_TASK_PATH.format(task_id=task_id), payload)
 
     def send_credential_alert(
         self,

@@ -266,11 +266,10 @@ def execute_task(
         env["ORKAFLOW_EXECUTION_MODE"] = execution_mode
         env["ORKAFLOW_WORKER_ROLE"] = "local"
 
-        command = [
-            str(python_exe),
-            str(entrypoint),
-            str(task_file),
-        ]
+        command = [str(python_exe), str(entrypoint)]
+        if getattr(bot, "reads_task_file_arg", True):
+            # Robô antigo: caminho do JSON em sys.argv[1] (o arquivo e as variáveis ORKAFLOW_* existem sempre).
+            command.append(str(task_file))
 
         logger.info(
             "Executando task | task_id=%s execution_mode=%s command=%s",
@@ -1933,6 +1932,7 @@ def _consume_process_output_live(
                 handled = maestro_events.handle_line(maestro_state, line)
                 if handled is not None:
                     level, log_message, send_to_task_log = handled
+                    _send_maestro_progress_if_changed(maestro_state, api, task_id, logger)
             else:
                 _append_capped(stderr_lines, line, MAX_CAPTURED_OUTPUT_LINES)
                 level, error_type = _classify_stderr_log(line)
@@ -1993,6 +1993,30 @@ def _consume_process_output_live(
 
 MAESTRO_SCREENSHOT_MAX_BYTES = 2 * 1024 * 1024
 MAESTRO_SCREENSHOT_MAX_WIDTH = 1600
+
+
+def _send_maestro_progress_if_changed(
+    state: maestro_events.MaestroState | None, api: TaskApiClient, task_id: int, logger
+) -> None:
+    """Envia a etapa ao backend quando ela muda, numa thread própria: a leitura do stdout nunca espera a rede."""
+    if state is None or state.last_step is None:
+        return
+    step = state.last_step
+    key = (step.current, step.total, step.text)
+    if getattr(state, "_sent_step", None) == key:
+        return
+    state._sent_step = key  # type: ignore[attr-defined]
+    send = getattr(api, "send_progress", None)
+    if send is None:
+        return
+
+    def _run() -> None:
+        try:
+            send(task_id, current=step.current, total=step.total, text=step.text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Progresso da task %s não enviado (%s): segue sem ele.", task_id, exc)
+
+    threading.Thread(target=_run, name=f"maestro-progress-{task_id}", daemon=True).start()
 
 
 def _maestro_final_message(state: maestro_events.MaestroState | None, default: str) -> str:

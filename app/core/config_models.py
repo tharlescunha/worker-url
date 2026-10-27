@@ -86,6 +86,8 @@ class BotRegistryItem(BaseModel):
 
     execution_mode: str = "background"
     auto_update: bool = False
+    # Robô antigo lê o caminho do JSON da task em sys.argv[1]; com maestro não precisa (out/2026).
+    reads_task_file_arg: bool = True
 
     # Backoff de instalação: evita reinstalar a cada ciclo um bot que falha sempre.
     install_failures: int = 0

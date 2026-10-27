@@ -127,6 +127,7 @@ def _sync_bots_locked(
         current.expected_commit = bot_data.get("commit_hash")
         current.execution_mode = bot_data.get("execution_mode") or current.execution_mode or "background"
         current.auto_update = bool(bot_data.get("auto_update", False))
+        current.reads_task_file_arg = bool(bot_data.get("reads_task_file_arg", True))
         current.last_sync_at = datetime.now(timezone.utc)
 
         if needs_install(current):
