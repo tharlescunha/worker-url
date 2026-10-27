@@ -42,6 +42,8 @@ class MaestroEnd:
     message: str
     category: str | None = None
     retryable: bool = False
+    items_processed: int | None = None
+    items_failed: int | None = None
 
 
 @dataclass
@@ -157,7 +159,14 @@ def _apply(state: MaestroState, event: dict[str, Any]) -> tuple[str, str, bool]:
     status = "error" if event.get("status") == "error" else "success"
     message = _text(event.get("message")) or ("Task finalizada com sucesso." if status == "success" else "Robô encerrou com erro.")
     category = _text(event.get("category"))
-    state.end = MaestroEnd(status=status, message=message, category=category, retryable=bool(event.get("retryable")))
+    state.end = MaestroEnd(
+        status=status,
+        message=message,
+        category=category,
+        retryable=bool(event.get("retryable")),
+        items_processed=_int(event.get("items_processed")),
+        items_failed=_int(event.get("items_failed")),
+    )
     next_automations = event.get("next_automations")
     tail = (
         f" Próximas automações: {', '.join(str(b) for b in next_automations)}."

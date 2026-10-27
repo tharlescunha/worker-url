@@ -366,8 +366,8 @@ def execute_task(
                 task_id=task_id,
                 status=TASK_STATUS_FINISHED,
                 final_message=_maestro_final_message(maestro_state, "Task finalizada com sucesso."),
-                items_processed=0,
-                items_failed=0,
+                items_processed=_maestro_items(maestro_state, "items_processed", 0),
+                items_failed=_maestro_items(maestro_state, "items_failed", 0),
                 result_json=result_json,
             )
 
@@ -414,8 +414,8 @@ def execute_task(
             task_id=task_id,
             status=TASK_STATUS_ERROR,
             final_message=final_message,
-            items_processed=0,
-            items_failed=1,
+            items_processed=_maestro_items(maestro_state, "items_processed", 0),
+            items_failed=_maestro_items(maestro_state, "items_failed", 1),
         )
 
         logger.error("Task finalizada com erro | task_id=%s returncode=%s", task_id, process.returncode)
@@ -2059,6 +2059,14 @@ def _send_maestro_attachments_if_new(
                 logger.warning("Anexo %s da task %s não enviado (%s).", name, task_id, exc)
 
         threading.Thread(target=_run, name=f"maestro-attach-{task_id}", daemon=True).start()
+
+
+def _maestro_items(state: maestro_events.MaestroState | None, field_name: str, default: int) -> int:
+    """Contadores informados pelo robô em success()/fail(); sem maestro, o valor de sempre."""
+    if state is None or state.end is None:
+        return default
+    value = getattr(state.end, field_name, None)
+    return default if value is None else int(value)
 
 
 def _maestro_final_message(state: maestro_events.MaestroState | None, default: str) -> str:

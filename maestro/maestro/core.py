@@ -276,28 +276,51 @@ class Maestro:
         self._next_automations.append(item)
 
     # ------------------------------------------------------------ encerramento
-    def success(self, message: str | None = None, result: Any = None) -> None:
+    def success(
+        self,
+        message: str | None = None,
+        result: Any = None,
+        *,
+        items_processed: int | None = None,
+        items_failed: int | None = None,
+    ) -> None:
         """Encerra o robô com sucesso: ``message`` vira a mensagem final da task e ``result`` (dict)
         vira o resultado, que alimenta eventos e o próximo robô.
 
-        Exemplo: ``maestro.success("42 pedidos lidos", result={"pedidos": 42})``"""
+        ``items_processed`` / ``items_failed`` (opcionais) preenchem os contadores "Processados" e
+        "Com falha" da task (ex.: pedidos lançados).
+
+        Exemplo: ``maestro.success("42 pedidos lançados", result={"pedidos": 42}, items_processed=42)``"""
         self._result = result
         self._write_result()
-        self._end("success", message or "Task finalizada com sucesso.")
+        self._end("success", message or "Task finalizada com sucesso.", items_processed=items_processed, items_failed=items_failed)
         raise SystemExit(EXIT_SUCCESS)
 
-    def fail(self, message: str, category: str = "system", retryable: bool | None = None, exit_code: int = EXIT_ERROR) -> None:
+    def fail(
+        self,
+        message: str,
+        category: str = "system",
+        retryable: bool | None = None,
+        exit_code: int = EXIT_ERROR,
+        *,
+        items_processed: int | None = None,
+        items_failed: int | None = None,
+    ) -> None:
         """Encerra o robô com erro e ``message`` como mensagem final da task.
 
         ``category``: ``"business"`` (regra de negócio, não adianta repetir) ou ``"system"`` (ambiente,
         pode repetir). ``retryable`` força o que a retentativa automática deve fazer.
+        ``items_processed`` / ``items_failed`` (opcionais): quantos itens deu tempo de processar.
 
         Exemplo: ``maestro.fail("Planilha não encontrada", category="business")``"""
         if category not in protocol.CATEGORIES:
             category = "system"
         if retryable is None:
             retryable = category == "system"
-        self._end("error", message, category=category, retryable=bool(retryable))
+        self._end(
+            "error", message, category=category, retryable=bool(retryable),
+            items_processed=items_processed, items_failed=items_failed,
+        )
         raise SystemExit(exit_code if exit_code != 0 else EXIT_ERROR)
 
     def credential_invalid(self, chave: str | None, motivo: str = "invalida", mensagem: str | None = None, sistema: str | None = None) -> None:
@@ -453,11 +476,23 @@ class Maestro:
         except Exception as exc:  # noqa: BLE001
             self.warning(f"Maestro: não consegui gravar o resultado: {exc}")
 
-    def _end(self, status: str, message: str, category: str | None = None, retryable: bool | None = None) -> None:
+    def _end(
+        self,
+        status: str,
+        message: str,
+        category: str | None = None,
+        retryable: bool | None = None,
+        items_processed: int | None = None,
+        items_failed: int | None = None,
+    ) -> None:
         if self._finished:
             return
         self._finished = True
         event: dict[str, Any] = {"type": protocol.EVENT_END, "status": status, "message": protocol.shorten(message, protocol.MAX_MESSAGE_CHARS)}
+        if items_processed is not None:
+            event["items_processed"] = max(0, _as_int(items_processed) or 0)
+        if items_failed is not None:
+            event["items_failed"] = max(0, _as_int(items_failed) or 0)
         if status == "error":
             event["category"] = category or "system"
             event["retryable"] = bool(retryable)

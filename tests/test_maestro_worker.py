@@ -80,6 +80,10 @@ class HandleLineTests(unittest.TestCase):
         self.assertIn("Planilha sumiu", text)
         self.assertEqual((state.end.status, state.end.category, state.end.retryable), ("error", "business", False))
         self.assertEqual(me.error_type_for(state.end, "bot_exit_code"), "bot_business_error")
+        me.handle_line(state, 'MAESTRO {"type":"end","status":"success","message":"ok","items_processed":42,"items_failed":2}')
+        self.assertEqual((state.end.items_processed, state.end.items_failed), (42, 2))
+        self.assertEqual(te._maestro_items(state, "items_processed", 0), 42)
+        self.assertEqual(te._maestro_items(me.MaestroState(), "items_failed", 1), 1)
 
     def test_hello_records_version(self):
         state = me.MaestroState()

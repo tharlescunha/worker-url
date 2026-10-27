@@ -55,7 +55,7 @@ class WorkerAttachTests(unittest.TestCase):
     def test_worker_reads_file_at_once_and_uploads_in_thread(self):
         with TemporaryDirectory() as tmp:
             f = Path(tmp) / "rel.csv"
-            f.write_text("a;b\n1;2\n", encoding="utf-8")
+            f.write_bytes(b"a;b\n1;2\n")
             state = me.MaestroState()
             line = "MAESTRO " + json.dumps({"type": "attach", "path": str(f), "name": "rel.csv", "size": 8, "description": "csv"})
             level, text, send = me.handle_line(state, line)
