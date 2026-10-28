@@ -66,6 +66,8 @@ class MaestroState:
     attachments_sent: int = 0
     events_seen: int = 0
     invalid_lines: int = 0
+    # Traceback que o robô mandou no log de erro (exceção não tratada), para o task_error.
+    last_traceback: str | None = None
 
     @property
     def used(self) -> bool:
@@ -120,6 +122,9 @@ def _apply(state: MaestroState, event: dict[str, Any]) -> tuple[str, str, bool]:
 
     if kind == EVENT_LOG:
         level = event.get("level") if event.get("level") in LEVELS else LEVEL_INFO
+        data = event.get("data")
+        if isinstance(data, dict) and isinstance(data.get("traceback"), str) and data["traceback"].strip():
+            state.last_traceback = data["traceback"]
         return level, _format_log(event), True
 
     if kind == EVENT_STEP:
@@ -187,6 +192,15 @@ def _format_log(event: dict[str, Any]) -> str:
             parts.append(f"{key}={value}")
         return f"{message} | " + " ".join(parts) if message else " ".join(parts)
     return message
+
+
+def strip_protocol_lines(text: str | None) -> str | None:
+    """Tira as linhas ``MAESTRO {...}`` de um texto (stdout/stderr do robô). None se não sobra nada."""
+    if not text:
+        return None
+    kept = [line for line in text.splitlines() if not line.lstrip().startswith(MAESTRO_MARKER + " ")]
+    cleaned = "\n".join(kept).strip()
+    return cleaned or None
 
 
 def error_type_for(end: MaestroEnd | None, default: str) -> str:

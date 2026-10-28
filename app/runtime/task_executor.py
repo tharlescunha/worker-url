@@ -380,14 +380,14 @@ def execute_task(
         is_retryable = False
         if maestro_state.end is not None and maestro_state.end.status == "error":
             # O robô explicou o erro pelo maestro: usa a explicação dele.
-            error_message = f"{maestro_state.end.message} (código de saída {process.returncode})"
+            error_message = maestro_state.end.message
             error_type = maestro_events.error_type_for(maestro_state.end, error_type)
             is_retryable = bool(maestro_state.end.retryable)
         if credential_alert is not None and process.returncode == CREDENTIAL_ALERT_EXIT_CODE:
             error_message = f"Credencial inválida: {credential_alert['mensagem']} Bot finalizou com código de saída {process.returncode}."
             error_type = "credential_invalid"
             is_retryable = False
-        trace_text = _build_stacktrace(stderr_text, stdout_text)
+        trace_text = _build_stacktrace(stderr_text, stdout_text, maestro_state)
         error_screenshot_base64 = _load_maestro_screenshot_base64(maestro_state, logger)
 
         try:
@@ -1635,7 +1635,26 @@ def _normalize_lines(text: str | None) -> list[str]:
     return lines
 
 
-def _build_stacktrace(stderr_text: str | None, stdout_text: str | None) -> str | None:
+def _build_stacktrace(
+    stderr_text: str | None,
+    stdout_text: str | None,
+    maestro_state: maestro_events.MaestroState | None = None,
+) -> str | None:
+    """Texto que vai como stacktrace do task_error.
+
+    Robô com maestro: o traceback que ele mesmo mandou (exceção não tratada) ou, se não houve,
+    o stderr/stdout sem as linhas ``MAESTRO {...}`` do protocolo (ninguém precisa ler JSON).
+    Erro de negócio explicado pelo robô (fail) fica só com a mensagem, sem stacktrace.
+    """
+    if maestro_state is not None and maestro_state.used:
+        if maestro_state.last_traceback:
+            return _shorten_text(maestro_state.last_traceback, 12000)
+        stderr_text = maestro_events.strip_protocol_lines(stderr_text)
+        stdout_text = maestro_events.strip_protocol_lines(stdout_text)
+        end = maestro_state.end
+        if end is not None and end.status == "error" and end.category == "business" and not stderr_text:
+            return None
+
     if stderr_text and stderr_text.strip():
         return _shorten_text(stderr_text, 12000)
 
