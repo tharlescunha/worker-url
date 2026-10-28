@@ -41,6 +41,20 @@ def is_input_desktop_available() -> bool:
         return True
 
 
+def current_os_user() -> str | None:
+    """DOMINIO\\usuario do Windows em que o worker está rodando (vai no heartbeat)."""
+    user = os.environ.get("USERNAME") or ""
+    if not user:
+        try:
+            import getpass
+
+            user = getpass.getuser()
+        except Exception:
+            return None
+    domain = os.environ.get("USERDOMAIN") or ""
+    return f"{domain}\\{user}" if domain else user
+
+
 def describe_session() -> str:
     return (
         f"usuario={os.environ.get('USERNAME', '?')} "
@@ -79,6 +93,7 @@ class HeartbeatThread(threading.Thread):
         self.logger = logger
         self._stop_event = threading.Event()
         self._consecutive_failures = 0
+        self._os_user = current_os_user()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -89,6 +104,7 @@ class HeartbeatThread(threading.Thread):
                 self.api.heartbeat(
                     ip=self.runner.ip,
                     running_tasks=self.manager.active_count(),
+                    os_user=self._os_user,
                 )
                 if self._consecutive_failures:
                     self.logger.info("Heartbeat restabelecido.")

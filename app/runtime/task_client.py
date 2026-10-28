@@ -387,10 +387,12 @@ class TaskApiClient:
             payload,
         )
 
-    def heartbeat(self, ip: str | None = None, running_tasks: int = 0) -> dict:
+    def heartbeat(self, ip: str | None = None, running_tasks: int = 0, os_user: str | None = None) -> dict:
         payload = self._auth_payload()
         payload["ip"] = ip
         payload["running_tasks"] = running_tasks
+        if os_user:
+            payload["os_user"] = os_user
 
         return self.client.post(HEARTBEAT_PATH, payload)
 
