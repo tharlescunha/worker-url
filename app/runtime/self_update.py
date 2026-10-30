@@ -13,6 +13,7 @@ Cuidados para nunca derrubar o worker por causa disso:
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -165,3 +166,19 @@ def restart_now_if_idle(active_tasks: int) -> bool:
     except Exception as exc:
         logger.warning("Não foi possível registrar o pedido de atualização; reinício cancelado: %s", exc)
         return False
+
+
+def exit_now(code: int = 0) -> None:
+    """Sai do processo na hora, sem esperar o encerramento normal do Python.
+
+    O encerramento normal chegou a ficar pendurado (worker sem heartbeat e launcher sem reabrir). Aqui o
+    estado já foi gravado em ``mark_handled``; ``os._exit`` entrega o código ao supervisor, que devolve o
+    controle ao .bat. Um relógio de segurança garante a saída mesmo se o flush dos logs travar.
+    """
+    guard = threading.Timer(5.0, lambda: os._exit(code))
+    guard.daemon = True
+    guard.start()
+    try:
+        logging.shutdown()
+    finally:
+        os._exit(code)

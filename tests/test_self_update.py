@@ -91,6 +91,15 @@ class SelfUpdateTests(unittest.TestCase):
         ):
             self.assertEqual(self_update.display_version(), self_update.WORKER_VERSION)
 
+    def test_exit_now_sai_com_o_codigo_mesmo_se_o_flush_dos_logs_falhar(self):
+        saidas = []
+        with mock.patch.object(self_update.os, "_exit", side_effect=saidas.append), mock.patch.object(
+            self_update.threading, "Timer"
+        ), mock.patch.object(self_update.logging, "shutdown", side_effect=RuntimeError("travou")):
+            with self.assertRaises(RuntimeError):
+                self_update.exit_now(0)
+        self.assertEqual(saidas, [0])
+
     def test_fora_do_supervisor_ignora_o_pedido(self):
         with mock.patch.object(self_update, "under_supervisor", return_value=False):
             self_update.on_heartbeat_response({"update_requested": True, "update_request_id": "A1"})

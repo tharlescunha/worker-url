@@ -202,7 +202,7 @@ def main() -> int:
     logger = setup_logging()
 
     print("=== ORKAFLOW WORKER ===")
-    print(f"Versão {WORKER_VERSION} | {describe_session()}")
+    print(f"Versão {self_update.display_version()} | {describe_session()}")
     print("Deixe este terminal aberto para executar as atividades.")
     print()
 
@@ -269,7 +269,7 @@ def main() -> int:
 
     logger.warning(
         "Worker iniciado | versao=%s runner_id=%s %s",
-        WORKER_VERSION,
+        self_update.display_version(),
         runner.id,
         describe_session(),
     )
@@ -316,7 +316,7 @@ def main() -> int:
                 # baixa o código novo e reabre. Com task em andamento, só para de pegar novas.
                 if self_update.restart_now_if_idle(manager.active_count()):
                     logger.warning("Saindo para atualizar o worker (pedido do painel).")
-                    return 0
+                    self_update.exit_now(0)
 
                 if not self_update.draining():
                     _start_available_tasks(task_api, manager, runner, log_buffer, logger)
