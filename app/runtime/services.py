@@ -11,7 +11,6 @@ from app.core.constants import (
     MAIN_LOOP_STALL_LIMIT_SECONDS,
     PULSE_FILE,
     PULSE_WRITE_INTERVAL_SECONDS,
-    WORKER_VERSION,
 )
 from app.runtime import self_update
 from app.runtime.task_client import TaskApiClient
@@ -108,7 +107,7 @@ class HeartbeatThread(threading.Thread):
                     running_tasks=self.manager.active_count(),
                     os_user=self._os_user,
                     worker_commit=self_update.current_commit(),
-                    worker_version=WORKER_VERSION,
+                    worker_version=self_update.display_version(),
                     update_ack=self_update.handled_id(),
                 )
                 self_update.on_heartbeat_response(response)

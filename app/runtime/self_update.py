@@ -19,7 +19,7 @@ from pathlib import Path
 
 import psutil
 
-from app.core.constants import RUNTIME_DIR
+from app.core.constants import RUNTIME_DIR, WORKER_VERSION
 
 logger = logging.getLogger("orkaflow_worker")
 
@@ -28,7 +28,9 @@ REPO_DIR = Path(__file__).resolve().parents[2]
 
 _lock = threading.Lock()
 _pending_id: str | None = None
+_ignored_id: str | None = None
 _commit_cache: str | None = None
+_version_cache: str | None = None
 
 
 def current_commit() -> str | None:
@@ -53,6 +55,33 @@ def current_commit() -> str | None:
     return _commit_cache
 
 
+def display_version() -> str:
+    """Versão mostrada no painel: ``0.3`` (de WORKER_VERSION) + número de commits do Git, que sobe a cada atualização.
+
+    Sem Git na máquina, cai no WORKER_VERSION puro.
+    """
+    global _version_cache
+    if _version_cache:
+        return _version_cache
+    base = ".".join(WORKER_VERSION.split(".")[:2])
+    try:
+        result = subprocess.run(
+            ["git", "rev-list", "--count", "HEAD"],
+            cwd=str(REPO_DIR),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        count = (result.stdout or "").strip()
+        if result.returncode == 0 and count.isdigit():
+            _version_cache = f"{base}.{count}"
+            return _version_cache
+    except Exception:
+        pass
+    return WORKER_VERSION
+
+
 def handled_id() -> str | None:
     """Código do último pedido atendido (confirmado ao backend no heartbeat)."""
     try:
@@ -63,16 +92,26 @@ def handled_id() -> str | None:
 
 
 def under_supervisor() -> bool:
+    """O supervisor está entre os ancestrais do processo.
+
+    Não basta olhar o pai direto: no Windows o Python da venv abre um processo intermediário, então
+    worker <- python (venv) <- supervisor <- python (venv) <- .bat. Procura nos primeiros ancestrais.
+    """
     try:
-        parent = psutil.Process().parent()
-        return bool(parent and "app.runtime.supervisor" in " ".join(parent.cmdline()))
+        for ancestor in psutil.Process().parents()[:6]:
+            try:
+                if "app.runtime.supervisor" in " ".join(ancestor.cmdline()):
+                    return True
+            except psutil.Error:
+                continue
     except Exception:
-        return False
+        pass
+    return False
 
 
 def on_heartbeat_response(response: dict | None) -> None:
     """Chamado a cada resposta do heartbeat; guarda o pedido pendente (ou o limpa)."""
-    global _pending_id
+    global _pending_id, _ignored_id
     try:
         request_id = (response or {}).get("update_request_id")
         wanted = bool((response or {}).get("update_requested")) and bool(request_id)
@@ -81,8 +120,9 @@ def on_heartbeat_response(response: dict | None) -> None:
                 _pending_id = None
                 return
             if not under_supervisor():
-                if _pending_id != request_id:
+                if _ignored_id != request_id:
                     logger.warning("Atualização pedida pelo painel ignorada: o worker não está sob o supervisor.")
+                    _ignored_id = request_id
                 _pending_id = None
                 return
             if _pending_id != request_id:

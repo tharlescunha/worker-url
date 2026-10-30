@@ -5,6 +5,8 @@ from unittest import mock
 
 from app.runtime import self_update
 
+_REAL = self_update.under_supervisor
+
 
 class SelfUpdateTests(unittest.TestCase):
     def setUp(self):
@@ -56,6 +58,38 @@ class SelfUpdateTests(unittest.TestCase):
         self.assertTrue(self_update.draining())
         self_update.on_heartbeat_response({"update_requested": False, "update_request_id": None})
         self.assertFalse(self_update.draining())
+
+    def test_supervisor_e_achado_entre_os_ancestrais_com_processo_intermediario_da_venv(self):
+        class _P:
+            def __init__(self, cmd):
+                self._cmd = cmd
+
+            def cmdline(self):
+                return self._cmd
+
+        com_supervisor = [
+            _P([r"C:env\python.exe", "-m", "app.runtime.main"]),  # intermediário da venv
+            _P([r"C:ase\python.exe", "-m", "app.runtime.supervisor"]),
+            _P(["cmd.exe", "/c", "iniciar_worker.bat"]),
+        ]
+        sem_supervisor = [_P(["cmd.exe"]), _P(["explorer.exe"])]
+
+        fake = mock.Mock()
+        # O setUp troca under_supervisor por um mock; _REAL é a função de verdade.
+        for ancestrais, esperado in ((com_supervisor, True), (sem_supervisor, False)):
+            fake.parents.return_value = ancestrais
+            with mock.patch.object(self_update.psutil, "Process", return_value=fake):
+                self.assertIs(_REAL(), esperado)
+
+    def test_versao_do_painel_sobe_com_os_commits_e_cai_no_fixo_sem_git(self):
+        with mock.patch.object(self_update, "_version_cache", None), mock.patch.object(
+            self_update.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="57")
+        ):
+            self.assertEqual(self_update.display_version(), "0.3.57")
+        with mock.patch.object(self_update, "_version_cache", None), mock.patch.object(
+            self_update.subprocess, "run", side_effect=OSError("sem git")
+        ):
+            self.assertEqual(self_update.display_version(), self_update.WORKER_VERSION)
 
     def test_fora_do_supervisor_ignora_o_pedido(self):
         with mock.patch.object(self_update, "under_supervisor", return_value=False):
