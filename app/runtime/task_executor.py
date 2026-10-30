@@ -236,6 +236,10 @@ def execute_task(
         acquire_screenshots(api, logger)
         screenshots_acquired = True
 
+        # Primeiro sinal de vida da execução local: o watchdog do backend usa os logs do worker
+        # para saber que a task saiu do "iniciada" e não ficou presa.
+        _send_worker_task_log(api, task_id, logger, "Execução local iniciada nesta máquina.")
+
         timeout_seconds = int(
             task_data.get("timeout_seconds")
             or bot.timeout_default
