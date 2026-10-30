@@ -23,6 +23,7 @@ from app.core.log_masking import UrlCredentialsFilter
 from app.core.logging_config import setup_logging
 from app.core.security import unprotect_text
 from app.runtime.auth_refresh import TokenRefresher
+from app.runtime import self_update
 from app.runtime.events import EventReporter
 from app.runtime.log_shipper import LogShipperThread, RemoteLogHandler
 from app.runtime.services import (
@@ -310,7 +311,15 @@ def main() -> int:
 
             try:
                 manager.cleanup_finished()
-                _start_available_tasks(task_api, manager, runner, log_buffer, logger)
+
+                # Atualização pedida pelo painel: sem task em andamento, sai (código 0) e o launcher
+                # baixa o código novo e reabre. Com task em andamento, só para de pegar novas.
+                if self_update.restart_now_if_idle(manager.active_count()):
+                    logger.warning("Saindo para atualizar o worker (pedido do painel).")
+                    return 0
+
+                if not self_update.draining():
+                    _start_available_tasks(task_api, manager, runner, log_buffer, logger)
                 consecutive_auth_errors = 0
 
             except AuthenticationError as exc:

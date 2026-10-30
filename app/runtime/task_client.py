@@ -387,12 +387,27 @@ class TaskApiClient:
             payload,
         )
 
-    def heartbeat(self, ip: str | None = None, running_tasks: int = 0, os_user: str | None = None) -> dict:
+    def heartbeat(
+        self,
+        ip: str | None = None,
+        running_tasks: int = 0,
+        os_user: str | None = None,
+        worker_commit: str | None = None,
+        worker_version: str | None = None,
+        update_ack: str | None = None,
+    ) -> dict:
         payload = self._auth_payload()
         payload["ip"] = ip
         payload["running_tasks"] = running_tasks
         if os_user:
             payload["os_user"] = os_user
+        # Versão do código em execução e confirmação do último pedido de atualização atendido.
+        if worker_commit:
+            payload["worker_commit"] = worker_commit
+        if worker_version:
+            payload["worker_version"] = worker_version
+        if update_ack:
+            payload["update_ack"] = update_ack
 
         return self.client.post(HEARTBEAT_PATH, payload)
 
